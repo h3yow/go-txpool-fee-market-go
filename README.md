@@ -7,14 +7,18 @@ implementation in Go.
 
 - `types` — `Transaction`, `Account`, deterministic hash, EIP-1559 fee math.
 - `reject` — structured rejection reasons (`MALFORMED`, `NONCE_TOO_LOW`,
-  `NONCE_TOO_HIGH`, `UNDERPRICED`, `INSUFFICIENT_FUNDS`, `POOL_FULL`,
-  `ALREADY_RESERVED`, `GAS_LIMIT`).
+  `NONCE_TOO_HIGH`, `UNDERPRICED`, `INSUFFICIENT_FUNDS`, `ACCOUNT_BUDGET`,
+  `POOL_FULL`, `ALREADY_RESERVED`, `GAS_LIMIT`).
 - `ledger` — authoritative account state, atomic `Apply`, undo-snapshot
   `Revert`, canonical-state `OverlayAccount`.
 - `pool` — fee-prioritised pool: nonce-ordered per-account queues,
-  price-bump replacement, deterministic cheapest-tail eviction.
+  two-level funds admission (single-tx `INSUFFICIENT_FUNDS` vs whole-queue
+  `ACCOUNT_BUDGET`), price-bump replacement, cheapest-tail eviction, and
+  `AccountStatus` for an explainable per-account queue view.
 - `packer` — block production: fee-ordered selection, block gas limit,
-  reserve/apply/confirm with rollback, reorg recovery.
+  balance-shrink-safe executable-prefix packing (one sender short of funds
+  never blocks the block or other senders), reserve/apply/confirm with
+  rollback, reorg recovery.
 
 ## Quick start
 

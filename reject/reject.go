@@ -24,8 +24,14 @@ const (
 	// ReasonUnderpriced: replacement without sufficient price bump, or cannot
 	// beat the cheapest pending transaction when the pool is full.
 	ReasonUnderpriced
-	// ReasonInsufficientFunds: balance below value + gasFeeCap*gas.
+	// ReasonInsufficientFunds: balance below value + gasFeeCap*gas for the
+	// single transaction taken alone.
 	ReasonInsufficientFunds
+	// ReasonAccountBudget: the transaction on its own is affordable, but the
+	// account cannot pay for its whole queued run once this tx is appended
+	// (sum of max costs of reserved + pending txs including the incoming one
+	// exceeds the current balance). Distinct from a single-tx shortfall.
+	ReasonAccountBudget
 	// ReasonPoolFull: capacity exhausted and no evictable cheaper tx exists.
 	ReasonPoolFull
 	// ReasonAlreadyReserved: tx content is already in-flight in a block.
@@ -47,6 +53,8 @@ func (r Reason) String() string {
 		return "UNDERPRICED"
 	case ReasonInsufficientFunds:
 		return "INSUFFICIENT_FUNDS"
+	case ReasonAccountBudget:
+		return "ACCOUNT_BUDGET"
 	case ReasonPoolFull:
 		return "POOL_FULL"
 	case ReasonAlreadyReserved:

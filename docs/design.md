@@ -31,10 +31,37 @@ nonce 连续的。
 | `MALFORMED` | 交易为 nil、gas 为 0、value/feeCap/tipCap 为 nil 或负数、tipCap > feeCap |
 | `NONCE_TOO_LOW` | nonce 低于账本 on-chain nonce，或已被同账户 pending/已提交交易占用 |
 | `NONCE_TOO_HIGH` | nonce 超过账户的下一个期望 nonce（存在空洞） |
-| `INSUFFICIENT_FUNDS` | 余额 < `value + GasFeeCap * gas`（提交时按最大可能费用检查） |
+| `INSUFFICIENT_FUNDS` | **单笔**就付不起：余额 < `value + GasFeeCap * gas` |
+| `ACCOUNT_BUDGET` | 单笔付得起，但把这笔加进来后，该账户**排队队列整体**（已保留 + pending）的最大成本合计超过当前余额 |
 | `UNDERPRICED` | 替换交易未达费用提升幅度，或池满时出价低于最便宜尾交易 |
 | `POOL_FULL` | 全局/每账户容量已满且无法驱逐 |
 | `ALREADY_RESERVED` | 该 nonce 已被打包进进行中的区块 |
+
+### 2.1 账户级预算准入（与单笔余额判定的区别）
+
+余额校验分两级，顺序执行，原因互不混淆：
+
+1. **单笔判定** `INSUFFICIENT_FUNDS`：当前余额连这一笔的最大成本
+   （`value + GasFeeCap * gas`）都不够——"这一笔本身就买不起"。
+2. **账户整体判定 `ACCOUNT_BUDGET`**：单笔通过后，把这笔接到该账户
+   nonce 连续队列的末尾，对队列内**所有**交易（含打包进在途区块的
+   reserved 交易，替换时同 nonce 旧交易被新交易顶替）的最大成本求和：
+
+   ```
+   budget = Σ Cost(tx)               // tx ∈ reserved ∪ pending ∪ {incoming}
+   若 balance < budget  -> ACCOUNT_BUDGET
+   ```
+
+   含义是"每一笔单看都买得起，但整个账户连着付根本付不起"。按最大成本
+   （fee cap 而非实际 tip）核算是保守口径：入池后即使 baseFee 变化，队列
+   作为一个整体仍然付得起，不会出现"入池时没问题、打包时整条链推进不动"。
+
+- 账户整体预算只按**本账户**求和；池满驱逐只可能裁剪**其他账户**的尾交易，
+  因此准入判定时看到的队列画像不会在入池前被驱逐改写。
+- 余额补足后重新提交完全相同的交易会正常入池（预算判定基于实时余额，
+  没有任何"曾经拒绝"的记忆）。
+- 同 nonce 替换同样过两级校验：替换交易可能更贵，必须保证替换后整条队列
+  仍然付得起。
 
 所有拒绝原因都可通过 `reject.AsDecision(err)` 取出，测试日志中同时打印
 **输入（nonce/tip/cap/gas）与判定依据（reason + detail）**，例如：
@@ -75,12 +102,49 @@ REJECT  nonce=0  tip=5   cap=21  gas=21000 reason=UNDERPRICED | replacement at n
    起的连续 nonce 前缀，再按有效 tip 降序合并；
 2. 区块 gas 限制（默认 10,000,000）：一旦某账户的头交易无法容纳，**整个账户
    跳过本区块**（`GAS_LIMIT`），但不影响其他账户；
-3. `pool.Reserve`：选中交易从 pending 视图移入"已保留"，pending 计数递减，
+3. **余额中途变小的取舍**：链上或其他入口可能在入池之后改小账户余额。选择
+   阶段按账户维护一个"剩余余额"，严格按 nonce 顺序模拟 `ledger.Apply` 的
+   精确扣费（`value + effectiveTip * gas`）：
+   - 付得起的前缀照常打进本区块；
+   - 第一笔付不起的交易标记 `INSUFFICIENT_FUNDS`（detail 给出剩余余额、
+     精确成本、nonce），它及之后同账户的交易**全部留在池里等下一块**
+     （后续交易在 skipped 中以"挂在付不起的前序交易之后"说明）；
+   - 这是**按账户截断**而不是整块失败：其他账户照常打包，单个账户余额不足
+     永远不会导致整块区块生不出来；
+   - 由于选中的正是每账户可执行 nonce 前缀，`ledger.Apply` 必然成功，
+     不存在 nonce 空档；池视图与账本严格对齐，不重复扣钱。
+4. `pool.Reserve`：选中交易从 pending 视图移入"已保留"，pending 计数递减，
    防止重复打包；
-4. `ledger.Apply` 原子提交：按顺序校验每笔交易的 nonce 与余额，通过则扣除
+5. `ledger.Apply` 原子提交：按顺序校验每笔交易的 nonce 与余额，通过则扣除
    `value + effectiveTip * gas`、推进 nonce、记录 undo 快照；
-5. 成功：`pool.Confirm` 清理保留；失败：`pool.Unreserve` 把交易退回 pending，
+6. 成功：`pool.Confirm` 清理保留；失败：`pool.Unreserve` 把交易退回 pending，
    账本无任何状态变化（§7）。
+
+余额补足后，留在池里的交易在下一次 `Produce` 时从当前 on-chain nonce 继续
+打包，天然闭环。
+
+### 5.1 账户排队视图：`pool.AccountStatus(addr, baseFee)`
+
+排查"这个账户排队到底什么情况"时直接查询，无需靠猜。返回 `AccountView`：
+
+| 字段 | 含义 |
+|---|---|
+| `Balance` | 账本实时余额 |
+| `ReservedNonces` | 已打进在途（未确认）区块的 nonce 列表 |
+| `QueuedMaxCost` | reserved + pending 全部交易的**最大成本合计** |
+| `BudgetOK` | 当前余额是否覆盖 `QueuedMaxCost`（即 §2.1 的账户级预算结论） |
+| `Items[]` | pending 交易按 nonce 升序，逐笔给出判定 |
+
+每笔 `QueuedItem` 的判定（`State` + 可读 `Reason`）：
+
+- `PACKABLE`：从实时余额出发，按 nonce 顺序逐笔扣精确成本
+  （`value + effectiveTip*gas`，reserved 交易先扣），这笔马上能打包；
+- `NO_FUNDS`：扣到这笔时剩余余额小于其精确成本，账户 nonce 链在此截断；
+- `DEFERRED`：挂在前面某笔付不起（或不连续）的交易之后，必须等待。
+
+注意两个口径的区别：`BudgetOK`/`QueuedMaxCost` 用**最大成本**（保守的准入
+视角）；逐笔 `PACKABLE` 判定用**精确成本**（打包视角，与 `ledger.Apply`
+一致）。余额被改小时，后者能准确显示"前几笔还能打、后几笔要等"的边界。
 
 ## 6. 并发与一致性
 
@@ -123,6 +187,14 @@ go test -race -count=3 ./...   # 竞态检测（重复 3 次）
 测试覆盖：
 
 - 提交校验与原因归类（malformed / nonce / balance）；
+- 同账户多笔连发的**整体预算准入**：单笔可付但队列合计付不起时 `ACCOUNT_BUDGET`，
+  与单笔 `INSUFFICIENT_FUNDS` 明确区分；reserved 在途交易计入预算；
+- 补足余额后重新提交同一交易正常入池；
+- `AccountStatus` 账户排队视图：总成本、`BudgetOK`、逐笔
+  `PACKABLE/NO_FUNDS/DEFERRED` 判定与原因；
+- 余额中途被改小后打包只取**可执行 nonce 前缀**，剩余交易留池并返回
+  `INSUFFICIENT_FUNDS` 决策；其他账户与整块产出不受拖累；池/账本 nonce、
+  余额对齐；充值后下一块继续打包；
 - 替换费用提升规则（tip 与 fee cap 双 10% 检查）；
 - 满载驱逐（最便宜尾交易、严格 outbid、suffix 连续）；
 - 每账户容量上限；
@@ -132,3 +204,11 @@ go test -race -count=3 ./...   # 竞态检测（重复 3 次）
 - 区块 gas 限制与账户链整体延迟；
 - 并发提交/打包的重复打包、重复扣减、nonce 空洞不变量；
 - 并发 produce/reorg/repack 循环收敛。
+
+新增行为的单测日志打印输入（nonce/tip/cap/gas、余额、队列合计成本）与判定
+依据（reason + detail），例如：
+
+```
+REJECT  nonce=2  reason=ACCOUNT_BUDGET | account 050000… cannot fund its whole queue: balance 2500 < aggregated max cost 3300 (incoming nonce 2 cost 1100 on top of 2 queued txs); top up the balance and resubmit
+deferred: INSUFFICIENT_FUNDS | live balance 300 < exact cost 1100 (nonce 2, value+effectiveTip*gas); only the executable prefix is packed, remainder deferred to next block
+```

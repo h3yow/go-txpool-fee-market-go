@@ -11,7 +11,8 @@ func TestDecisionReasonString(t *testing.T) {
 	want := map[Reason]string{
 		ReasonMalformed: "MALFORMED", ReasonNonceTooLow: "NONCE_TOO_LOW",
 		ReasonNonceTooHigh: "NONCE_TOO_HIGH", ReasonUnderpriced: "UNDERPRICED",
-		ReasonInsufficientFunds: "INSUFFICIENT_FUNDS", ReasonPoolFull: "POOL_FULL",
+		ReasonInsufficientFunds: "INSUFFICIENT_FUNDS", ReasonAccountBudget: "ACCOUNT_BUDGET",
+		ReasonPoolFull:        "POOL_FULL",
 		ReasonAlreadyReserved: "ALREADY_RESERVED", ReasonGasLimit: "GAS_LIMIT",
 	}
 	for r, s := range want {

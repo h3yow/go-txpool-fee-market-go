@@ -6,6 +6,12 @@
 //     at ledgerNonce + numberReserved. Gapped submissions are rejected.
 //   - A same-account/same-nonce replacement must raise BOTH the effective tip
 //     (at the pool's base fee) and the fee cap by at least PriceBumpPct.
+//   - Admission has two funds levels: the tx alone must be affordable
+//     (INSUFFICIENT_FUNDS otherwise), AND the account's whole queued run
+//     (in-flight reservations + pending txs, with the incoming tx appended)
+//     must be payable at maximum cost from the current balance; otherwise it
+//     is rejected with ACCOUNT_BUDGET, so queued txs never become collectively
+//     unpackable due to admission alone.
 //   - When global capacity is full, the globally cheapest per-account tail is
 //     evicted, and only if the incoming tx strictly outbids it. Evicting tails
 //     (never middles) keeps every account's nonce run contiguous.
@@ -151,12 +157,44 @@ func (p *Pool) Submit(tx *types.Transaction) error {
 	if balance == nil {
 		balance = new(big.Int)
 	}
+	// Two-level funds gate. First the single tx taken alone ...
 	if cost := tx.Cost(); balance.Cmp(cost) < 0 {
 		return reject.New(tx, reject.ReasonInsufficientFunds,
 			"balance %s < value+maxFee cost %s (nonce %d)", balance, cost, tx.Nonce)
 	}
+	// ... then the account's whole queued run (in-flight reservations plus
+	// pending txs) with this tx appended. Every admitted tx extends the
+	// contiguous nonce run, and eviction only ever trims OTHER accounts, so
+	// this picture cannot change before insertLocked below.
+	if q != nil {
+		if total := p.budgetAfterAdmitLocked(q, tx); balance.Cmp(total) < 0 {
+			return reject.New(tx, reject.ReasonAccountBudget,
+				"account %x cannot fund its whole queue: balance %s < aggregated max cost %s "+
+					"(incoming nonce %d cost %s on top of %d queued txs); top up the balance and resubmit",
+				tx.From[:6], balance, total, tx.Nonce, tx.Cost(), len(q.reserved)+len(q.txs))
+		}
+	}
 
 	return p.insertLocked(tx)
+}
+
+// budgetAfterAdmitLocked returns the aggregate maximum cost the account would
+// be committed to if tx were admitted at its nonce: sum of value+GasFeeCap*gas
+// over every in-flight reservation and every pending tx, with a same-nonce
+// pending tx superseded by the incoming replacement. Caller holds mu.
+func (p *Pool) budgetAfterAdmitLocked(q *accountQueue, tx *types.Transaction) *big.Int {
+	total := new(big.Int)
+	for _, r := range q.reserved {
+		total.Add(total, r.Cost())
+	}
+	for n, t := range q.txs {
+		if n == tx.Nonce {
+			continue // replacement: old tx is swapped for the incoming one
+		}
+		total.Add(total, t.Cost())
+	}
+	total.Add(total, tx.Cost())
+	return total
 }
 
 // validateFormat checks field-level legality.
@@ -197,7 +235,9 @@ func (p *Pool) replaceLocked(tx, old *types.Transaction) error {
 			"replacement at nonce %d needs effective tip >= %s (got %s) and feeCap >= %s (got %s), bump %d%%",
 			tx.Nonce, minTip, newTip, minCap, tx.GasFeeCap, p.cfg.PriceBumpPct)
 	}
-	// Re-check balance for the replacement (it may cost more).
+	// Re-check funds for the replacement (it may cost more): first the
+	// replacement alone, then the account's whole queued budget with the old
+	// same-nonce tx superseded by the replacement.
 	acc := p.ledger.GetAccount(tx.From)
 	balance := acc.Balance
 	if balance == nil {
@@ -209,6 +249,11 @@ func (p *Pool) replaceLocked(tx, old *types.Transaction) error {
 	}
 	// Size-neutral swap.
 	q := p.accounts[tx.From]
+	if total := p.budgetAfterAdmitLocked(q, tx); balance.Cmp(total) < 0 {
+		return reject.New(tx, reject.ReasonAccountBudget,
+			"replacement would make account %x unaffordable as a queue: balance %s < aggregated max cost %s (nonce %d)",
+			tx.From[:6], balance, total, tx.Nonce)
+	}
 	q.txs[tx.Nonce] = tx
 	delete(p.all, old.Hash())
 	p.all[tx.Hash()] = tx
