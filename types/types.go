@@ -82,6 +82,13 @@ func (t *Transaction) Cost() *big.Int {
 	return new(big.Int).Add(t.Value, fee)
 }
 
+// EffectiveFee returns EffectiveTip(baseFee)*Gas: the fee actually charged at
+// commit time for the given base fee (used for packing-time affordability
+// simulation; admission keeps using the conservative Cost()).
+func (t *Transaction) EffectiveFee(baseFee *big.Int) *big.Int {
+	return new(big.Int).Mul(t.EffectiveTip(baseFee), new(big.Int).SetUint64(t.Gas))
+}
+
 // Account is a ledger account state.
 type Account struct {
 	Nonce   uint64

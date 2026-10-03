@@ -6,10 +6,18 @@
 //  1. select fee-ordered pending txs (nonce-contiguous per sender);
 //  2. enforce block gas limit while skipping a sender wholesale once its head
 //     cannot fit (never splits a sender's run);
-//  3. Reserve txs in the pool (removed from pending view);
-//  4. ledger.Apply atomically deducts balances and advances nonces;
-//  5. on success Confirm (drop reservations); on failure Unreserve (the
-//     ledger changed nothing, so the pool view stays consistent).
+//  3. per sender, simulate the CURRENT ledger balance: deduct each tx's
+//     value + effectiveTip*gas in nonce order. If the balance was reduced
+//     (chain/other entry) so that a tx (and hence the rest of its nonce run)
+//     can no longer be paid, only the still-continuously-executable prefix is
+//     taken; the suffix stays pending for the next block with ACCOUNT_BUDGET
+//     decisions. Other accounts are never blocked;
+//  4. Reserve txs in the pool (removed from pending view);
+//  5. ledger.Apply atomically deducts balances and advances nonces (the
+//     simulation guarantees it cannot fail on the selected set);
+//  6. on success Confirm (drop reservations); on the unexpected failure
+//     Unreserve (the ledger changed nothing, so the pool view stays
+//     consistent).
 package packer
 
 import (
@@ -96,34 +104,81 @@ func (pc *Packer) Produce(maxTx int) (*Block, []*reject.Decision, error) {
 }
 
 // selectForBlock walks the fee-ordered, per-sender-nonce-ordered candidate
-// list. Once a sender's head tx cannot fit in the remaining gas, that sender
-// is skipped for the remainder of THIS block (to avoid nonce holes); later
-// txs of other senders are still considered.
+// list. Two independent per-sender stop conditions defer the REMAINDER of that
+// sender's nonce run for this block only (to avoid nonce holes), while later
+// txs of other senders are still considered:
+//
+//   - block gas: once the sender's head cannot fit the remaining gas it is
+//     deferred with GAS_LIMIT;
+//   - account budget: the sender's CURRENT ledger balance, as it stands after
+//     the txs already selected earlier in this block, is simulated in nonce
+//     order. The first tx whose value + effectiveTip*gas exceeds the simulated
+//     balance truncates the run: it and every later tx of this sender are
+//     deferred with ACCOUNT_BUDGET. Because only the affordable prefix is
+//     selected, the subsequent ledger.Apply cannot fail on a balance shortfall
+//     and one broke account never blocks the whole block.
 func (pc *Packer) selectForBlock(candidates []*types.Transaction, maxTx int) (selected []*types.Transaction, skipped []*reject.Decision, gasUsed uint64) {
 	blockedSenders := make(map[types.Address]bool)
+	// Per-sender simulated running balance over the txs selected so far.
+	budget := make(map[types.Address]*big.Int)
+	// Per-sender deferral reason once blocked, so the message is consistent.
+	blockReason := make(map[types.Address]reject.Reason)
 	skippedSet := make(map[types.Hash]bool)
+
+	deferTx := func(tx *types.Transaction, reason reject.Reason, format string, args ...any) {
+		if skippedSet[tx.Hash()] {
+			return
+		}
+		skippedSet[tx.Hash()] = true
+		skipped = append(skipped, reject.New(tx, reason, format, args...))
+	}
+
 	for _, tx := range candidates {
 		if maxTx > 0 && len(selected) >= maxTx {
 			break
 		}
 		if blockedSenders[tx.From] {
-			if !skippedSet[tx.Hash()] {
-				skipped = append(skipped, reject.New(tx, reject.ReasonGasLimit,
-					"sender head did not fit block gas; deferred with nonce chain"))
-				skippedSet[tx.Hash()] = true
+			switch blockReason[tx.From] {
+			case reject.ReasonGasLimit:
+				deferTx(tx, reject.ReasonGasLimit,
+					"sender head did not fit block gas; deferred with nonce chain")
+			default:
+				deferTx(tx, reject.ReasonAccountBudget,
+					"sender balance exhausted mid-run; deferred with nonce chain awaiting a top-up")
 			}
 			continue
 		}
 		if gasUsed+tx.Gas > pc.blockGasLmt {
 			blockedSenders[tx.From] = true
-			if !skippedSet[tx.Hash()] {
-				skipped = append(skipped, reject.New(tx, reject.ReasonGasLimit,
-					"gas %d would exceed block remaining %d (used %d/%d); sender deferred",
-					tx.Gas, pc.blockGasLmt-gasUsed, gasUsed, pc.blockGasLmt))
-				skippedSet[tx.Hash()] = true
-			}
+			blockReason[tx.From] = reject.ReasonGasLimit
+			deferTx(tx, reject.ReasonGasLimit,
+				"gas %d would exceed block remaining %d (used %d/%d); sender deferred",
+				tx.Gas, pc.blockGasLmt-gasUsed, gasUsed, pc.blockGasLmt)
 			continue
 		}
+
+		// Lazily seed the simulated balance from the CURRENT authoritative
+		// ledger state (may have been reduced since admission).
+		work, ok := budget[tx.From]
+		if !ok {
+			acc := pc.ledger.GetAccount(tx.From)
+			work = new(big.Int)
+			if acc.Balance != nil {
+				work.Set(acc.Balance)
+			}
+			budget[tx.From] = work
+		}
+		need := new(big.Int).Add(tx.Value,
+			new(big.Int).Mul(tx.EffectiveTip(pc.baseFee), new(big.Int).SetUint64(tx.Gas)))
+		if work.Cmp(need) < 0 {
+			blockedSenders[tx.From] = true
+			blockReason[tx.From] = reject.ReasonAccountBudget
+			deferTx(tx, reject.ReasonAccountBudget,
+				"balance changed: sender %x simulated balance %s < required %s for nonce %d (value %s + effTip %s * gas %d); only the executable prefix is packed, suffix deferred",
+				tx.From[:6], work, need, tx.Nonce, tx.Value, tx.EffectiveTip(pc.baseFee), tx.Gas)
+			continue
+		}
+		work.Sub(work, need)
 		selected = append(selected, tx)
 		gasUsed += tx.Gas
 	}

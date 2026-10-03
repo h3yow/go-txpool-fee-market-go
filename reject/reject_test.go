@@ -12,6 +12,7 @@ func TestDecisionReasonString(t *testing.T) {
 		ReasonMalformed: "MALFORMED", ReasonNonceTooLow: "NONCE_TOO_LOW",
 		ReasonNonceTooHigh: "NONCE_TOO_HIGH", ReasonUnderpriced: "UNDERPRICED",
 		ReasonInsufficientFunds: "INSUFFICIENT_FUNDS", ReasonPoolFull: "POOL_FULL",
+		ReasonAccountBudget:   "ACCOUNT_BUDGET",
 		ReasonAlreadyReserved: "ALREADY_RESERVED", ReasonGasLimit: "GAS_LIMIT",
 	}
 	for r, s := range want {
