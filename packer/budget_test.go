@@ -198,3 +198,132 @@ func TestProduceDrainedAccountDoesNotBlockOthers(t *testing.T) {
 	}
 	t.Log("drained s1 deferred wholesale; s2 block committed; no whole-block failure")
 }
+
+// TestSubmitWhileBlockInFlightCountsReservation drives the exact reported
+// window through Produce itself: after the block's txs are Reserved but before
+// the ledger atomically applies them, the same account keeps submitting. The
+// in-flight money is un-deducted in the ledger but spoken for, so the whole
+// account is judged committed-run + queued-run; the over-committing tx comes
+// back as ACCOUNT_BUDGET (distinct from single-tx INSUFFICIENT_FUNDS), never
+// enters the pool, and the same tx packs normally after a top-up. No money is
+// double-charged and no nonce hole appears.
+func TestSubmitWhileBlockInFlightCountsReservation(t *testing.T) {
+	pc, p, l := newSystem(t, 0) // baseFee 0, tip==cap=2, gas100 -> cost 200 each
+	l.SetBalance(pad(1), big.NewInt(1000))
+	mk := func(n uint64) *types.Transaction { return ptx(1, n, 0, 2, 2, 100) }
+
+	// First block: nonces 0,1 (400). While it is in flight the account fires
+	// nonces 2..5. With 400 already committed: 2,3,4 fit (400+600=1000) and
+	// nonce5 would need 1200, so it is rejected by the account-level gate.
+	started := make(chan struct{})
+	resume := make(chan struct{})
+	var windowErr error
+	pc.SetAfterReserveHook(func() {
+		close(started)
+		<-resume
+	})
+	defer pc.SetAfterReserveHook(nil)
+
+	for _, n := range []uint64{0, 1} {
+		mustSubmit(t, p, mk(n))
+	}
+
+	produced := make(chan struct{})
+	go func() {
+		defer close(produced)
+		_, _, windowErr = pc.Produce(0)
+	}()
+	<-started
+
+	for _, n := range []uint64{2, 3, 4} {
+		if err := p.Submit(mk(n)); err != nil {
+			t.Errorf("nonce %d must be admitted while the batch is in flight: %v", n, err)
+		}
+	}
+	t.Log("during in-flight block (nonces 0,1 = 400, ledger still shows 1000): nonces 2,3,4 ACCEPT (400+600=1000)")
+
+	over := mk(5)
+	err := p.Submit(over)
+	d, ok := reject.AsDecision(err)
+	if !ok {
+		t.Fatalf("nonce5 must be a *Decision while in flight, got %v", err)
+	}
+	t.Logf("REJECT  nonce=5 standalone 200 < balance 1000 but in-flight 400 + projected 800 = 1200 -> %s | %s",
+		d.Reason, d.Detail)
+	if d.Reason != reject.ReasonAccountBudget {
+		t.Fatalf("want ACCOUNT_BUDGET counting the in-flight batch, got %s", d.Reason)
+	}
+
+	// Single-tx shortfall from another account keeps its own reason.
+	l.SetBalance(pad(9), big.NewInt(100))
+	if d9, _ := reject.AsDecision(p.Submit(ptx(9, 0, 0, 2, 2, 100))); d9 == nil || d9.Reason != reject.ReasonInsufficientFunds {
+		t.Fatalf("single-tx shortfall must stay INSUFFICIENT_FUNDS, got %v", d9)
+	}
+
+	// The rejected tx never entered and nothing queued was displaced.
+	if size, _ := p.Stats(); size != 3 {
+		t.Fatalf("only nonces 2,3,4 pending during the window, got %d", size)
+	}
+	if p.Has(over.Hash()) {
+		t.Fatal("rejected nonce5 must not be tracked")
+	}
+
+	// Let the in-flight block commit: ledger deducts once, nonce advances,
+	// reservations clear.
+	close(resume)
+	<-produced
+	pc.SetAfterReserveHook(nil)
+	if windowErr != nil {
+		t.Fatalf("in-flight produce: %v", windowErr)
+	}
+	s1 := l.GetAccount(pad(1))
+	if s1.Nonce != 2 || s1.Balance.Cmp(big.NewInt(600)) != 0 {
+		t.Fatalf("after block1: want nonce2 bal600 (400 charged once), got nonce%d bal%s", s1.Nonce, s1.Balance)
+	}
+	t.Logf("block1 committed once: nonce=%d balance=%s; queue is nonces 2,3,4 contiguous", s1.Nonce, s1.Balance)
+
+	// Second block packs the admitted queue against the deducted balance:
+	// 600 covers nonces 2,3,4 exactly; no skips, no nonce hole.
+	b2, skipped, err := pc.Produce(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(skipped) != 0 || b2 == nil || len(b2.Txs) != 3 {
+		t.Fatalf("nonces 2,3,4 should all pack (600 <= 600), got txs=%d skipped=%d: %s",
+			lenIf(b2), len(skipped), sumD(skipped))
+	}
+	s1 = l.GetAccount(pad(1))
+	if s1.Nonce != 5 || s1.Balance.Sign() != 0 {
+		t.Fatalf("after block2 want nonce5 bal0, got nonce%d bal%s", s1.Nonce, s1.Balance)
+	}
+	t.Logf("block2 packed %s: nonce=%d balance=%s (no double deduction, no nonce gap)",
+		sumIDs(b2.Txs), s1.Nonce, s1.Balance)
+
+	// Top up and resubmit the exact tx rejected during the window: it enters and
+	// packs with no resubmission churn for the already-confirmed prefix.
+	l.AddBalance(pad(1), big.NewInt(500))
+	if err := p.Submit(over); err != nil {
+		t.Fatalf("after top-up, previously rejected nonce5 must enter: %v", err)
+	}
+	b3, skipped3, err := pc.Produce(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(skipped3) != 0 || b3 == nil || len(b3.Txs) != 1 || b3.Txs[0].Nonce != 5 {
+		t.Fatalf("nonce5 must pack alone after top-up, got txs=%d skipped=%s", lenIf(b3), sumD(skipped3))
+	}
+	if got := l.GetAccount(pad(1)); got.Nonce != 6 || got.Balance.Cmp(big.NewInt(300)) != 0 {
+		t.Fatalf("final want nonce6 bal300, got nonce%d bal%s", got.Nonce, got.Balance)
+	}
+	t.Log("top-up +500: the window-rejected nonce5 entered and packed; nonce chain 0..5 complete, pool drained")
+	if size, _ := p.Stats(); size != 0 {
+		t.Fatalf("pool must be drained, got %d", size)
+	}
+}
+
+func lenIf(b *Block) int {
+	if b == nil {
+		return 0
+	}
+	return len(b.Txs)
+}

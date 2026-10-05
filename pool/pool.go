@@ -7,10 +7,12 @@
 //   - A same-account/same-nonce replacement must raise BOTH the effective tip
 //     (at the pool's base fee) and the fee cap by at least PriceBumpPct.
 //   - Admission is budget-checked at the ACCOUNT level: the maximum cost of the
-//     whole pending run projected after the insert must fit the sender's current
-//     balance. A tx that is affordable alone yet would make the account's queue
-//     collectively unaffordable is rejected with ReasonAccountBudget (distinct
-//     from the single-tx ReasonInsufficientFunds).
+//     whole run projected after the insert — pending queue PLUS the money already
+//     handed to in-flight (packed but unconfirmed) batches that the ledger
+//     balance has not deducted yet — must fit the sender's current balance. A tx
+//     that is affordable alone yet would make the account's committed+queued
+//     run collectively unaffordable is rejected with ReasonAccountBudget
+//     (distinct from the single-tx ReasonInsufficientFunds).
 //   - When global capacity is full, the globally cheapest per-account tail is
 //     evicted, and only if the incoming tx strictly outbids it. Evicting tails
 //     (never middles) keeps every account's nonce run contiguous.
@@ -173,34 +175,75 @@ func (p *Pool) Submit(tx *types.Transaction) error {
 	return p.insertLocked(tx)
 }
 
-// pendingCostLocked sums value + GasFeeCap*Gas (the conservative admission
-// basis) over every tx currently pending in q, sorted by nonce.
-func pendingCostLocked(q *accountQueue) (*big.Int, int) {
+// nonceSortedLocked returns the pending nonces of q in ascending order.
+func nonceSortedLocked(q *accountQueue) []uint64 {
 	nonces := make([]uint64, 0, len(q.txs))
 	for n := range q.txs {
 		nonces = append(nonces, n)
 	}
 	sort.Slice(nonces, func(i, j int) bool { return nonces[i] < nonces[j] })
+	return nonces
+}
+
+// pendingCostLocked sums value + GasFeeCap*Gas (the conservative admission
+// basis) over every tx currently pending in q, sorted by nonce.
+func pendingCostLocked(q *accountQueue) (*big.Int, int) {
 	total := new(big.Int)
-	for _, n := range nonces {
+	for _, n := range nonceSortedLocked(q) {
 		total.Add(total, q.txs[n].Cost())
 	}
-	return total, len(nonces)
+	return total, len(q.txs)
+}
+
+// reservedCostLocked sums the money ALREADY COMMITTED to in-flight (packed but
+// not yet confirmed) batches but not yet reflected in the ledger balance. The
+// pool must count it at admission because the window between Reserve and the
+// ledger deducting the money still shows the un-deducted balance, and accepting
+// more txs against that balance would over-commit the account.
+//
+// Two bases are returned, both skipping stale reservations (a reserved nonce
+// below the on-chain nonce was already committed by the ledger, so counting it
+// would double-spend the budget):
+//   - max: sum of value + GasFeeCap*gas, the conservative admission basis;
+//   - eff: sum of value + effectiveTip(baseFee)*gas, what the packed batch will
+//     actually charge at commit time, used for the packing-style simulation.
+func (p *Pool) reservedCostLocked(q *accountQueue, onchainNonce uint64) (max, eff *big.Int, liveCount int) {
+	max, eff = new(big.Int), new(big.Int)
+	nonces := make([]uint64, 0, len(q.reserved))
+	for n := range q.reserved {
+		nonces = append(nonces, n)
+	}
+	sort.Slice(nonces, func(i, j int) bool { return nonces[i] < nonces[j] })
+	for _, n := range nonces {
+		if n < onchainNonce {
+			continue // stale: ledger already committed it and deducted the spend
+		}
+		tx := q.reserved[n]
+		max.Add(max, tx.Cost())
+		eff.Add(eff, new(big.Int).Add(tx.Value, tx.EffectiveFee(p.baseFee)))
+		liveCount++
+	}
+	return max, eff, liveCount
 }
 
 // accountBudgetDecisionLocked returns a *reject.Decision (ReasonAccountBudget)
-// when the projected pending run of tx.From — the current pending maximum costs,
-// minus the cost of the replaced tx old (if any), plus tx.Cost() — exceeds the
-// account balance. It returns nil when the account as a whole is affordable.
-// Reserved (in-flight) txs are not counted: they already left the pending view
-// and their spend is reflected in the authoritative ledger balance.
+// when the account's WHOLE committed+queued run cannot be covered by the
+// current balance: the maximum costs of live in-flight reservations (packed but
+// not yet confirmed, hence not yet deducted from the ledger balance) plus the
+// projected pending run — current pending maximum costs, minus the replaced tx
+// old (if any), plus tx.Cost() — must not exceed the balance. It returns nil
+// when the account as a whole is affordable.
 func (p *Pool) accountBudgetDecisionLocked(tx, old *types.Transaction, balance *big.Int) *reject.Decision {
+	acc := p.ledger.GetAccount(tx.From)
+	var reservedTotal *big.Int
+	var reservedCount int
 	var total *big.Int
 	var count int
 	if q := p.accounts[tx.From]; q != nil {
+		reservedTotal, _, reservedCount = p.reservedCostLocked(q, acc.Nonce)
 		total, count = pendingCostLocked(q)
 	} else {
-		total = new(big.Int)
+		reservedTotal, total = new(big.Int), new(big.Int)
 	}
 	if old != nil {
 		total.Sub(total, old.Cost())
@@ -208,12 +251,13 @@ func (p *Pool) accountBudgetDecisionLocked(tx, old *types.Transaction, balance *
 	}
 	total.Add(total, tx.Cost())
 	count++
-	if total.Cmp(balance) <= 0 {
+	grand := new(big.Int).Add(reservedTotal, total)
+	if grand.Cmp(balance) <= 0 {
 		return nil
 	}
 	return reject.New(tx, reject.ReasonAccountBudget,
-		"account %x projected queue of %d txs needs max budget %s but balance is %s (this tx max cost %s; nonce %d): top up the account or remove later txs",
-		tx.From[:6], count, total, balance, tx.Cost(), tx.Nonce)
+		"account %x whole run needs max budget %s but balance is %s: %d in-flight tx(s) already reserve %s (not yet deducted), %d queued tx(s) project %s after this tx (max cost %s; nonce %d): top up the account or wait for in-flight confirmation",
+		tx.From[:6], grand, balance, reservedCount, reservedTotal, count, total, tx.Cost(), tx.Nonce)
 }
 
 // validateFormat checks field-level legality.
@@ -615,9 +659,10 @@ type PlannedTx struct {
 }
 
 // AccountView answers "what is this account queueing right now": its pending
-// txs in nonce order with per-tx packability, the total maximum budget the
-// queue requires, whether the current balance covers it, and how many txs are
-// immediately packable versus deferred and why.
+// txs in nonce order with per-tx packability, the money already committed to
+// in-flight (packed but unconfirmed) batches, the total maximum budget the
+// whole committed+queued run requires, whether the current balance covers it,
+// and how many txs are immediately packable versus deferred and why.
 type AccountView struct {
 	Addr           types.Address
 	OnchainNonce   uint64
@@ -625,12 +670,27 @@ type AccountView struct {
 	BaseFee        *big.Int
 	Pending        []*PlannedTx
 	ReservedNonces []uint64 // nonces packed into in-flight blocks
-	// MaxBudget sums value + GasFeeCap*gas over ALL pending txs.
+	// ReservedMaxBudget sums value + GasFeeCap*gas over LIVE reservations
+	// (nonces >= on-chain nonce): money already handed to an in-flight batch
+	// that the ledger balance has not deducted yet, counted on the conservative
+	// admission basis. Stale reservations (nonce < on-chain nonce) are excluded
+	// because the ledger already spent that money.
+	ReservedMaxBudget *big.Int
+	// ReservedEffCost sums value + effectiveTip(baseFee)*gas over the same live
+	// reservations: what the in-flight batch will actually charge at commit. It
+	// is the amount the packing-style prefix simulation starts by reserving.
+	ReservedEffCost *big.Int
+	// PendingMaxBudget sums value + GasFeeCap*gas over the pending txs only.
+	PendingMaxBudget *big.Int
+	// MaxBudget is the account-level admission basis: ReservedMaxBudget plus
+	// the pending maximum costs, i.e. the whole committed+queued run.
 	MaxBudget *big.Int
 	// BudgetOK reports MaxBudget <= Balance (the account-level admission
-	// basis): false means the queue as a whole is over budget.
+	// basis including in-flight reservations): false means the account as a
+	// whole — reservations and queue together — is over budget.
 	BudgetOK bool
-	// ReadyCount is how many txs are packable right now (contiguous, funded).
+	// ReadyCount is how many pending txs are packable right now (contiguous and
+	// covered by balance minus what the in-flight batch will actually charge).
 	ReadyCount int
 }
 
@@ -647,12 +707,15 @@ func (p *Pool) AccountView(addr types.Address) *AccountView {
 		balance = new(big.Int)
 	}
 	v := &AccountView{
-		Addr:         addr,
-		OnchainNonce: acc.Nonce,
-		Balance:      new(big.Int).Set(balance),
-		BaseFee:      new(big.Int).Set(p.baseFee),
-		Pending:      []*PlannedTx{},
-		MaxBudget:    new(big.Int),
+		Addr:              addr,
+		OnchainNonce:      acc.Nonce,
+		Balance:           new(big.Int).Set(balance),
+		BaseFee:           new(big.Int).Set(p.baseFee),
+		Pending:           []*PlannedTx{},
+		ReservedMaxBudget: new(big.Int),
+		ReservedEffCost:   new(big.Int),
+		PendingMaxBudget:  new(big.Int),
+		MaxBudget:         new(big.Int),
 	}
 
 	q := p.accounts[addr]
@@ -667,11 +730,16 @@ func (p *Pool) AccountView(addr types.Address) *AccountView {
 	sort.Slice(reserved, func(i, j int) bool { return reserved[i] < reserved[j] })
 	v.ReservedNonces = reserved
 
-	nonces := make([]uint64, 0, len(q.txs))
-	for n := range q.txs {
-		nonces = append(nonces, n)
-	}
-	sort.Slice(nonces, func(i, j int) bool { return nonces[i] < nonces[j] })
+	// Money already committed to the in-flight batch but not yet deducted from
+	// the ledger balance. It must occupy room in both the aggregate admission
+	// budget (max costs) and the executable-prefix simulation (effective fees),
+	// otherwise the view would report more packable txs than the next block can
+	// actually pay for after the in-flight batch confirms.
+	resMax, resEff, _ := p.reservedCostLocked(q, acc.Nonce)
+	v.ReservedMaxBudget = resMax
+	v.ReservedEffCost = resEff
+
+	nonces := nonceSortedLocked(q)
 
 	// Next nonce packing can reach, skipping in-flight reservations.
 	expected := acc.Nonce
@@ -682,9 +750,13 @@ func (p *Pool) AccountView(addr types.Address) *AccountView {
 
 	// Running balances for the two independent views:
 	//   - cumulative max cost drives the aggregate admission budget;
-	//   - effective-fee simulation reproduces the packer's executable prefix.
+	//   - effective-fee simulation reproduces the packer's executable prefix,
+	//     starting AFTER the money the in-flight batch will charge.
 	cumMax := new(big.Int)
-	work := new(big.Int).Set(balance)
+	work := new(big.Int).Sub(balance, resEff)
+	if work.Sign() < 0 {
+		work.SetInt64(0)
+	}
 	stoppedBudget := false
 	for _, n := range nonces {
 		tx := q.txs[n]
@@ -725,8 +797,9 @@ func (p *Pool) AccountView(addr types.Address) *AccountView {
 		v.Pending = append(v.Pending, pt)
 	}
 
-	v.MaxBudget = cumMax
-	v.BudgetOK = cumMax.Cmp(balance) <= 0
+	v.PendingMaxBudget = cumMax
+	v.MaxBudget = new(big.Int).Add(resMax, cumMax)
+	v.BudgetOK = v.MaxBudget.Cmp(balance) <= 0
 	for _, pt := range v.Pending {
 		if pt.Status == TxPlanReady {
 			v.ReadyCount++

@@ -67,24 +67,43 @@ REJECT  nonce=0  tip=5   cap=21  gas=21000 reason=UNDERPRICED | replacement at n
 | 口径 | 计算 | 拒绝原因 | 含义 |
 |---|---|---|---|
 | 单笔 | `value + GasFeeCap * gas` 与当前余额比较 | `INSUFFICIENT_FUNDS` | 这笔交易**自己**就付不起 |
-| 账户整体 | 账户 pending 队列**全部**交易的最大花费合计与余额比较 | `ACCOUNT_BUDGET` | 这笔本身付得起，但**整个账户排队合计**付不起 |
+| 账户整体 | **已交给在途批次（Reserved，已打包未确认）的 live 交易**与账户 pending 队列**全部**交易的最大花费合计，与当前余额比较 | `ACCOUNT_BUDGET` | 这笔本身付得起，但**整个账户（在途占用 + 排队合计）**付不起 |
 
 两层都按**最大可能费用**（`GasFeeCap*gas`）保守计算，先做单笔、再做合计，
 因此两类原因互不重叠、一眼可区分。例如余额 1000、5 笔各需最大花费 200 的
 交易：前 5 笔合计正好 1000 全部收下；第 6 笔单笔只需 200（< 1000），但合计
 变为 1200 > 1000，以 `ACCOUNT_BUDGET` 拒绝，池内仍是前 5 笔。
 
+**为什么在途批次也要计入（本次修复的核心）**：一批交易被 `Reserve`（交给
+正在出的块）之后、`ledger.Apply` 真正扣款之前存在一个窗口——账本余额账面
+还没被扣。若此时同一账户继续连发，仅按 pending 合计准入会按"余额还够"把
+后续交易全收下，可前面那批一旦确认扣款，账户前后合计早已超余额，后面收下
+的就打不了包（"收下却打不了包"）。因此账户级预算必须按账户**一起算总账**：
+
+```
+账户整体最大预算 = Σ live reserved 最大花费 + Σ pending 最大花费（含本次提交）
+准入要求         : 账户整体最大预算 <= 当前账本余额
+```
+
+- 只计 **live** 预留：预留 nonce 低于 on-chain nonce 的属于**陈旧预留**
+  （账本已经提交并扣过款，只是 `Confirm` 还没跑），必须跳过，否则同一笔钱
+  被算两次。确认后（nonce 推进、预留清理）该部分自动不再计入。
 - **替换交易**同样过账户整体预算（更贵的替换可能把队列顶过余额上限），
   合计时用新交易花费替换掉旧交易花费；拒绝时旧交易保留、池尺寸不变。
-- 已 `Reserve`（打包进在途区块）的交易**不计入**合计：它们已离开 pending
-  视图，其花费已经体现在账本的权威余额里，不会被重复计算。
-- 预算是**按账户**的：一个账户超额只拒绝它自己的新交易，不影响其他账户。
+- 被 `ACCOUNT_BUDGET` 拒绝的交易**不进池、不触发驱逐**；预算按账户独立，
+  一个账户超额不牵连其他账户；余额补上后同一笔交易（hash 不变）正常入池，
+  准入不做任何缓存或熔断。
 
 ### 4.2 补足余额后重新入池
 
-准入只看**提交那一刻**的余额，不做任何缓存/熔断。账户充值后（`AddBalance`
-等），再次提交此前被 `ACCOUNT_BUDGET` 拒绝的同一笔交易（hash 相同、字段相同）
-会正常入池；已经在池里的前缀交易也无需任何操作，下一次打包自然能推进。
+准入只看**提交那一刻**的余额（含当刻 live 在途占用），不做任何缓存/熔断。
+两种路径都会自然恢复，无需重新提交已在池里的前缀：
+
+- 在途批次确认后，账本真正扣款、nonce 推进、预留清理，账户整体预算自动
+  让出这部分占用；
+- 账户充值后（`AddBalance` 等），此前被 `ACCOUNT_BUDGET` 拒绝的同一笔交易
+  （hash 相同、字段相同）再次提交会正常入池；已经在池里的前缀无需任何操作，
+  下一次打包自然能推进。
 
 ### 4.3 账户排队视图 `pool.AccountView(addr)`
 
@@ -97,16 +116,28 @@ REJECT  nonce=0  tip=5   cap=21  gas=21000 reason=UNDERPRICED | replacement at n
     `DEFERRED_BUDGET`（在模拟余额用尽点之后，等充值）、
     `DEFERRED_GAP`（nonce 低于链上 nonce 或落在空洞之后）；
   - `Reason`：状态的人类可读说明；
-  - `MaxCost` / `CumulativeMaxCost`：该笔最大花费与到此为止的合计预算；
-- `ReservedNonces`：已进入在途区块的 nonce；
-- `MaxBudget`：全部 pending 交易的最大花费合计；
-- `BudgetOK`：`MaxBudget <= Balance`，即账户整体准入口径是否达标；
-- `ReadyCount`：当前马上可打包的交易数。
+  - `MaxCost` / `CumulativeMaxCost`：该笔最大花费与到此笔为止的 **pending**
+    合计预算（不含在途预留）；
+- `ReservedNonces`：已进入在途区块的 live nonce；
+- `ReservedMaxBudget`：live 在途预留按最大费用的占用金额（准入保守口径），
+  即"账面余额看着没扣、但其实已经说出去的钱"；
+- `ReservedEffCost`：同批 live 在途预留按有效费用（`value +
+  effectiveTip(baseFee) * gas`）的占用，是逐笔可执行前缀模拟的起点；
+- `PendingMaxBudget`：pending 交易最大花费合计；
+- `MaxBudget`：**账户整体准入口径** = `ReservedMaxBudget + PendingMaxBudget`；
+- `BudgetOK`：`MaxBudget <= Balance`，含在途占用的账户整体是否达标；
+- `ReadyCount`：当前马上能打包的 pending 笔数——模拟从
+  `余额 - ReservedEffCost` 出发逐笔扣有效费用，余额够且 nonce 连续才记
+  READY，因此在途批次未确认时"马上能打包的数量"也会如实变少，不会按没扣过
+  的余额虚高。
 
 注意视图里有两组**互相独立**的口径，不要混用：`MaxBudget/BudgetOK` 用最大
-费用回答"整个账户付不付得起（准入）"；逐笔的 `READY/DEFERRED_BUDGET` 用
-打包时有效费用 `value + effectiveTip*gas` 顺序模拟，回答"此刻能连续执行到
-哪一笔（打包）"。base fee 为 0、`tip == cap` 时两者数值一致。
+费用回答"整个账户（在途占用 + 队列）付不付得起（准入）"；逐笔的
+`READY/DEFERRED_BUDGET` 用打包时有效费用 `value + effectiveTip*gas` 顺序模拟
+（先扣除在途有效占用），回答"在途批次确认后，此刻还能连续执行到哪一笔
+（打包）"。base fee 为 0、`tip == cap` 时两者数值一致。视图结论与真正去
+`packer.Produce` 时的取舍一致：在途批次确认前，能报 READY 的只有"扣除它将
+扣的钱之后"仍连续付得起的那段。
 
 ## 5. 容量管理与驱逐
 
@@ -162,9 +193,22 @@ on-chain nonce，后缀以链上 nonce 为新起点保持连续，因此既不�
   `pool.Confirm` 尚未清理保留交易的窗口内，`nextExpectedLocked` 与 `Pending`
   从 on-chain nonce 起逐个扫描保留位，自动忽略低于 on-chain nonce 的 stale
   reserved，因此提交方不会误判为"nonce 已占用"。
+- **一边出块一边并发提交**：`Reserve` 之后、`Apply` 之前的窗口里，账本余额
+  尚未扣除本块将扣的钱。准入与 `AccountView` 在这个窗口仍按
+  "live 在途占用 + 排队合计 ≤ 账面余额"把关：付不起整体账的那笔以
+  `ACCOUNT_BUDGET` 当场拒绝（不进池、不顶掉已有交易），而不是先收下等本块
+  扣款后再打不了包。由于 `Reserve` 持有的池锁会在锁释放后才允许提交、
+  `Apply` 又对选中集合做原子校验，同一笔钱不会被扣两次；本块确认后 nonce
+  推进、池里剩下的后缀与新 on-chain nonce 严格连续，无空档。测试通过
+  `Packer.SetAfterReserveHook`（仅供测试，在 Reserve 与 Apply 之间注入动作）
+  确定性地复现该窗口，并叠加并发压测。
 - 测试 `TestConcurrentSubmitAndProduce`（8 发送方 × 40 nonce，并发提交 +
   持续打包）验证了：每笔交易只被打包一次、nonce 集合连续、余额扣除与
   已提交交易的实际花费完全相等、池与账本最终一致。
+- 测试 `TestConcurrentInFlightBudgetAdmission` 先在确定性窗口内断言窗口提交
+  被 `ACCOUNT_BUDGET` 拒且不牵连其他账户，再以 8 发送方 × 40 nonce、每块
+  16 笔、余额分批充值的方式并发提交/出块，断言无重复扣款、无 nonce 空档、
+  最终余额精确为 0 且 `-race` 干净。
 
 ## 8. 链回退（reorg）处理
 
@@ -207,11 +251,47 @@ go test -race -count=3 ./...   # 竞态检测（重复 3 次）
   单笔付得起但合计超额被 `ACCOUNT_BUDGET` 拒绝（与单笔 `INSUFFICIENT_FUNDS`
   明确区分）、不影响其他账户、充值后同一笔交易正常入池；以及更贵替换把队列
   顶过预算时被拒且保持尺寸中性；
+- **在途批次窗口的整体预算**（`pool/budget_test.go` 的
+  `TestAccountBudgetIncludesInFlightReservations`、
+  `TestAccountViewCountsInFlightOccupation`）：同一账户的前几笔被 `Reserve`
+  进在途批次、账本尚未扣款时连发后续，超出"在途占用 + 排队合计"的那笔以
+  `ACCOUNT_BUDGET` 拒绝（区别于单笔 `INSUFFICIENT_FUNDS`）、不进池不顶掉
+  已有交易；批次确认后仍超额时继续被拒，充值后同一笔正常入池；视图的
+  `ReservedMaxBudget/ReservedEffCost/PendingMaxBudget/MaxBudget/BudgetOK/
+  ReadyCount` 与逐笔状态在有 live 预留、预留期间余额变小、确认后三种情形下
+  与真实打包取舍一致；
+- **出块窗口提交**（`packer/budget_test.go` 的
+  `TestSubmitWhileBlockInFlightCountsReservation`）：用
+  `SetAfterReserveHook` 确定性卡在 Reserve 与 Apply 之间提交：窗口内超额笔
+  以账户级原因被拒、其他账户不受牵连；放行后本块只扣一次、无 nonce 空档，
+  第二块打排队后缀，充值后窗口被拒的那笔入池并继续打包；
+- **并发出块/提交预算收敛**（`packer/concurrent_test.go` 的
+  `TestConcurrentInFlightBudgetAdmission`）：确定性窗口断言 + 8 发送方 × 40
+  nonce、每块 16 笔、余额分批充值的并发压测，断言每笔只打一次、无重复扣款、
+  无 nonce 空档、最终精确收敛且 `-race` 干净；
 - **余额中途变小只打可执行前缀**（`packer/budget_test.go`）：入池后把两个
   账户余额改小，`Produce` 只打包仍连续付得起的前缀，后缀以 `ACCOUNT_BUDGET`
   留在池中，其他账户/整块区块不被卡死；断言账本只扣前缀、nonce 无空档、池
   与账本视图一致、无重复扣减；充值后再次 `Produce` 后缀全部一次性入块；
   另覆盖头交易都付不起的极端账户不阻断出块；
-- **账户排队视图**：`pool.AccountView` 的 `MaxBudget/BudgetOK`、逐笔
-  `READY / DEFERRED_BUDGET / DEFERRED_GAP` 及原因、在途保留 nonce 与充值前
-  后的变化。
+- **账户排队视图**：`pool.AccountView` 的
+  `ReservedMaxBudget/ReservedEffCost/PendingMaxBudget/MaxBudget/BudgetOK`、
+  逐笔 `READY / DEFERRED_BUDGET / DEFERRED_GAP` 及原因、在途保留 nonce 与
+  充值前后的变化。
+
+### 9.1 本地手工验证步骤
+
+不依赖测试框架也能快速自查（`baseFee=0, tip=cap=2, gas=100` 时每笔最大花费 =
+有效花费 = 200）：
+
+1. 账户 A 余额 1000，提交 nonce 0,1 后用 packer 的 `Produce`（或直接
+   `pool.Reserve`）把它们交给在途批次，此时 `ledger.GetAccount(A).Balance`
+   仍显示 1000；
+2. 在批次确认前继续提交 nonce 2,3,4（在途 400 + 排队 600 = 1000，全部收下），
+   再提交 nonce 5：单笔 200 付得起，但 400 + 800 = 1200 > 1000，必须返回
+   `ACCOUNT_BUDGET`，且 `Pool.Stats` 与窗口前一致、其他账户提交不受影响；
+3. 调 `pool.AccountView(A)` 应看到 `ReservedMaxBudget=400`、
+   `PendingMaxBudget=600`、`MaxBudget=1000`、`BudgetOK=true`、`ReadyCount=3`；
+4. 批次确认（`ledger.Apply` + `pool.Confirm`）后余额变 600、nonce 变 2；
+   `AddBalance` 补足后重提同一笔 nonce 5 正常入池，再次 `Produce` 后缀
+   nonce 2..5 连续入块，余额精确、无重复扣款。

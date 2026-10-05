@@ -14,11 +14,14 @@ implementation in Go.
   `Revert`, canonical-state `OverlayAccount`.
 - `pool` — fee-prioritised pool: nonce-ordered per-account queues,
   price-bump replacement, deterministic cheapest-tail eviction, **account-level
-  aggregate-budget admission** and `AccountView` queue inspection.
+  aggregate-budget admission that also counts txs already handed to an
+  in-flight (packed but unconfirmed) batch**, and `AccountView` queue
+  inspection (in-flight occupation broken out).
 - `packer` — block production: fee-ordered selection, block gas limit,
   per-sender balance simulation that packs only the still-executable nonce
   prefix when a balance changed mid-flight (suffix deferred, other accounts
-  never blocked), reserve/apply/confirm with rollback, reorg recovery.
+  never blocked), reserve/apply/confirm with rollback, a test-only
+  Reserve→Apply hook for the concurrent-submit window, and reorg recovery.
 
 ## Quick start
 

@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/h3yow/go-txpool-fee-market-go/ledger"
+	"github.com/h3yow/go-txpool-fee-market-go/pool"
 	"github.com/h3yow/go-txpool-fee-market-go/reject"
 )
 
@@ -234,4 +236,203 @@ func TestConcurrentReorgSafety(t *testing.T) {
 		t.Fatalf("final balance %s want %s", got, want)
 	}
 	t.Logf("5 produce/reorg/repack cycles converged: nonce=15 balance=%s (no double deduction)", want)
+}
+
+// TestConcurrentInFlightBudgetAdmission covers "producing while submitting" for
+// the account-level in-flight budget. It is split in two parts:
+//
+// A deterministic window (via the Reserve->Apply hook) proves that a tx landing
+// while the account's batch is in flight is rejected ACCOUNT_BUDGET (not
+// single-tx INSUFFICIENT_FUNDS), never enters the pool and does not touch other
+// accounts. Then a concurrent phase (8 senders submitting tight-budget runs
+// while a producer packs continuously and a cashier tops balances up in
+// increments) proves there is no double packing/spend, no nonce gap and no
+// data race; transient budget/funds rejections are simply retried with the
+// exact same tx.
+func TestConcurrentInFlightBudgetAdmission(t *testing.T) {
+	const senders = 8
+	const perSender = 40
+	const gas = uint64(100)
+	cost := int64(101) // baseFee 0: value 1 + tip 1*gas100
+
+	pc, p, l := func() (*Packer, *pool.Pool, *ledger.Ledger) {
+		ll := ledger.New()
+		pp := pool.New(pool.Config{GlobalSlots: 4096, AccountSlots: 64, PriceBumpPct: 10}, ll, big.NewInt(0))
+		return New(pp, ll, big.NewInt(0)), pp, ll
+	}()
+	for s := 1; s <= senders; s++ {
+		l.SetBalance(pad(byte(s)), big.NewInt(cost*20)) // only the first half
+	}
+
+	// --- Phase A: one deterministic in-flight window ----------------------
+	// Uses senders outside the 1..8 contention range and drains them before
+	// Phase B, so a phase-A nonce can never collide with a phase-B submitter.
+	const aFrom, otherFrom byte = 91, 92
+	l.SetBalance(pad(aFrom), big.NewInt(cost*20))
+	l.SetBalance(pad(otherFrom), big.NewInt(cost*20))
+	mustSubmit(t, p, ptx(aFrom, 0, 1, 1, 1, gas))
+	mustSubmit(t, p, ptx(aFrom, 1, 1, 1, 1, gas))
+	started := make(chan struct{})
+	resume := make(chan struct{})
+	pc.SetAfterReserveHook(func() { close(started); <-resume })
+	doneA := make(chan struct{})
+	var errA error
+	go func() {
+		defer close(doneA)
+		_, _, errA = pc.Produce(2)
+	}()
+	<-started
+	// Ledger still shows 2020; the in-flight batch (nonces 0,1) already speaks
+	// for 202. Nonces 2..19 fit (20*101 = 2020); nonce 20 would need 2121.
+	for n := uint64(2); n < 20; n++ {
+		if err := p.Submit(ptx(aFrom, n, 1, 1, 1, gas)); err != nil {
+			t.Errorf("nonce %d must fit alongside the in-flight batch: %v", n, err)
+		}
+	}
+	d, _ := reject.AsDecision(p.Submit(ptx(aFrom, 20, 1, 1, 1, gas)))
+	if d == nil || d.Reason != reject.ReasonAccountBudget {
+		t.Fatalf("nonce20 during in-flight batch want ACCOUNT_BUDGET, got %v", d)
+	}
+	t.Logf("deterministic window: REJECT s%dn20 -> %s | %s", aFrom, d.Reason, d.Detail)
+	if p.Has(ptx(aFrom, 20, 1, 1, 1, gas).Hash()) {
+		t.Fatal("window-rejected tx must not enter the pool")
+	}
+	// An unrelated account is admitted and is not blocked by the over-budget one.
+	if err := p.Submit(ptx(otherFrom, 0, 1, 1, 1, gas)); err != nil {
+		t.Fatalf("unrelated sender must be admitted in the window: %v", err)
+	}
+	close(resume)
+	<-doneA
+	pc.SetAfterReserveHook(nil)
+	if errA != nil {
+		t.Fatalf("windowed produce: %v", errA)
+	}
+	if got := l.GetAccount(pad(aFrom)); got.Nonce != 2 || got.Balance.Cmp(big.NewInt(cost*18)) != 0 {
+		t.Fatalf("after windowed block: s%d want nonce2 bal%d, got nonce%d bal%s", aFrom, cost*18, got.Nonce, got.Balance)
+	}
+	// Drain phase-A leftovers so the contention phase starts with the 1..8
+	// accounts only; s91 has nonces 2..19 pending and enough balance left.
+	for {
+		b, _, err := pc.Produce(64)
+		if err != nil {
+			t.Fatalf("drain phase A: %v", err)
+		}
+		if b == nil {
+			break
+		}
+	}
+	if got := l.GetAccount(pad(aFrom)); got.Nonce != 20 || got.Balance.Sign() != 0 {
+		t.Fatalf("phase A sender must settle at nonce20 bal0, got nonce%d bal%s", got.Nonce, got.Balance)
+	}
+	t.Logf("window closed and drained: s%d nonce=20 balance=0; unrelated s%d unaffected (in-flight spend charged once)",
+		aFrom, otherFrom)
+
+	// --- Phase B: contention ----------------------------------------------
+	var submitWG sync.WaitGroup
+	for s := 1; s <= senders; s++ {
+		s := s
+		submitWG.Add(1)
+		go func() {
+			defer submitWG.Done()
+			for n := 0; n < perSender; n++ {
+				tx := ptx(byte(s), uint64(n), 1, 1, 1, gas)
+				for {
+					err := p.Submit(tx)
+					if err == nil {
+						break
+					}
+					d, ok := reject.AsDecision(err)
+					if !ok {
+						t.Errorf("non-decision error: %v", err)
+						return
+					}
+					switch d.Reason {
+					case reject.ReasonAccountBudget, reject.ReasonInsufficientFunds,
+						reject.ReasonNonceTooHigh, reject.ReasonAlreadyReserved,
+						reject.ReasonPoolFull:
+						// Budget/funds are moving (batch in flight, balance 0
+						// between top-ups, head just packed); the same tx is
+						// admissible moments later.
+						time.Sleep(time.Microsecond)
+						continue
+					default:
+						t.Errorf("unexpected rejection %s for s%dn%d: %s", d.Reason, s, n, d.Detail)
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	// Cashier: bring every account up to the exact full-run budget by the end.
+	go func() {
+		for step := 0; step < 4; step++ {
+			time.Sleep(2 * time.Millisecond)
+			for s := 1; s <= senders; s++ {
+				l.AddBalance(pad(byte(s)), big.NewInt(cost*5))
+			}
+		}
+	}()
+
+	var producedMu sync.Mutex
+	var produced [][2]byte
+	producerDone := make(chan struct{})
+	go func() {
+		defer close(producerDone)
+		submitsDone := false
+		for {
+			b, _, err := pc.Produce(16)
+			if err != nil {
+				t.Errorf("produce: %v", err)
+				return
+			}
+			if b != nil {
+				producedMu.Lock()
+				for _, tx := range b.Txs {
+					produced = append(produced, [2]byte{tx.From[0], byte(tx.Nonce)})
+				}
+				producedMu.Unlock()
+			}
+			if !submitsDone {
+				select {
+				case <-waitGroupChan(&submitWG):
+					submitsDone = true
+				default:
+				}
+			}
+			if submitsDone && b == nil {
+				return
+			}
+			if b == nil {
+				time.Sleep(time.Microsecond)
+			}
+		}
+	}()
+
+	submitWG.Wait()
+	<-producerDone
+
+	count := make(map[[2]byte]int)
+	for _, k := range produced {
+		count[k]++
+	}
+	for k, c := range count {
+		if c != 1 {
+			t.Fatalf("sender%d nonce%d packed %d times", k[0], k[1], c)
+		}
+	}
+	for s := 1; s <= senders; s++ {
+		acc := l.GetAccount(pad(byte(s)))
+		if acc.Nonce != perSender {
+			t.Fatalf("sender%d final nonce %d != %d (gap/loss)", s, acc.Nonce, perSender)
+		}
+		if acc.Balance.Sign() != 0 {
+			t.Fatalf("sender%d balance %s != 0 (exact-budget funding, double deduction?)", s, acc.Balance)
+		}
+	}
+	if size, _ := p.Stats(); size != 0 {
+		t.Fatalf("pool must be drained, got %d", size)
+	}
+	t.Logf("contention settled: all %d senders at nonce %d with balance 0; %d txs packed exactly once, no gaps/double spend",
+		senders, perSender, len(produced))
 }

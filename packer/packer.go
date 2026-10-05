@@ -49,6 +49,19 @@ type Packer struct {
 	ledger      *ledger.Ledger
 	baseFee     *big.Int
 	blockGasLmt uint64
+	// afterReserveHook, when set, runs inside Produce AFTER the selected txs
+	// have been Reserved in the pool but BEFORE ledger.Apply commits them. It is
+	// intended for tests that need to act in the exact window where an in-flight
+	// batch occupies budget while the ledger balance is still un-deducted.
+	afterReserveHook func()
+}
+
+// SetAfterReserveHook installs (or clears with nil) a hook run between the
+// pool Reserve and ledger Apply steps of Produce. Test support only.
+func (pc *Packer) SetAfterReserveHook(h func()) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	pc.afterReserveHook = h
 }
 
 // Option customises a Packer.
@@ -91,6 +104,9 @@ func (pc *Packer) Produce(maxTx int) (*Block, []*reject.Decision, error) {
 	}
 
 	pc.pool.Reserve(selected)
+	if pc.afterReserveHook != nil {
+		pc.afterReserveHook()
+	}
 
 	id := pc.ledger.Head() + 1
 	if err := pc.ledger.Apply(id, pc.baseFee, selected); err != nil {
