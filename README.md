@@ -14,7 +14,8 @@ implementation in Go.
   `Revert`, canonical-state `OverlayAccount`.
 - `pool` — fee-prioritised pool: nonce-ordered per-account queues,
   price-bump replacement, deterministic cheapest-tail eviction, **account-level
-  aggregate-budget admission** and `AccountView` queue inspection.
+  aggregate-budget admission that also counts txs already reserved in an
+  in-flight (unsettled) block**, and `AccountView` queue inspection.
 - `packer` — block production: fee-ordered selection, block gas limit,
   per-sender balance simulation that packs only the still-executable nonce
   prefix when a balance changed mid-flight (suffix deferred, other accounts
@@ -41,10 +42,12 @@ for _, d := range skipped {
     log.Printf("deferred: %s: %s", d.Reason, d.Detail)
 }
 
-// Inspect exactly what one account is queueing right now.
+// Inspect exactly what one account is queueing right now. The bill includes
+// txs already reserved in an in-flight, not-yet-settled block.
 view := p.AccountView(addr)
-log.Printf("balance=%s maxBudget=%s budgetOK=%v ready=%d/%d",
-    view.Balance, view.MaxBudget, view.BudgetOK, view.ReadyCount, len(view.Pending))
+log.Printf("balance=%s inFlight=%v reservedMax=%s maxBudget=%s budgetOK=%v ready=%d/%d",
+    view.Balance, view.LiveReservedNonces, view.ReservedMaxBudget,
+    view.MaxBudget, view.BudgetOK, view.ReadyCount, len(view.Pending))
 for _, pt := range view.Pending {
     log.Printf("nonce=%d %s: %s", pt.Tx.Nonce, pt.Status, pt.Reason)
 }

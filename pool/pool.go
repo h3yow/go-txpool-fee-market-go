@@ -7,10 +7,14 @@
 //   - A same-account/same-nonce replacement must raise BOTH the effective tip
 //     (at the pool's base fee) and the fee cap by at least PriceBumpPct.
 //   - Admission is budget-checked at the ACCOUNT level: the maximum cost of the
-//     whole pending run projected after the insert must fit the sender's current
-//     balance. A tx that is affordable alone yet would make the account's queue
-//     collectively unaffordable is rejected with ReasonAccountBudget (distinct
-//     from the single-tx ReasonInsufficientFunds).
+//     whole projected account bill must fit the sender's current balance. The
+//     bill includes BOTH the pending run AND the live reservations already
+//     handed to an in-flight block whose spend is not yet reflected in the
+//     authoritative ledger balance (reserved nonce >= on-chain nonce); stale
+//     reservations (nonce < on-chain nonce) are excluded because their block
+//     already deducted the money. A tx that is affordable alone yet would make
+//     the account's total bill unaffordable is rejected with
+//     ReasonAccountBudget (distinct from the single-tx ReasonInsufficientFunds).
 //   - When global capacity is full, the globally cheapest per-account tail is
 //     evicted, and only if the incoming tx strictly outbids it. Evicting tails
 //     (never middles) keeps every account's nonce run contiguous.
@@ -56,6 +60,11 @@ type Pool struct {
 }
 
 // accountQueue keeps one pending tx per nonce plus packed-but-unconfirmed ones.
+// A reservation is LIVE while its nonce is at/above the on-chain nonce: the tx
+// has been handed to an in-flight block but the ledger balance is not yet
+// charged, so its spend is still encumbering the visible balance. A reservation
+// whose nonce fell below the on-chain nonce is STALE (its block already charged
+// the money) and must never be counted again.
 type accountQueue struct {
 	txs      map[uint64]*types.Transaction // pending (visible to Pending)
 	reserved map[uint64]*types.Transaction // packed in an in-flight block
@@ -162,11 +171,13 @@ func (p *Pool) Submit(tx *types.Transaction) error {
 			"balance %s < value+maxFee cost %s (nonce %d)", balance, cost, tx.Nonce)
 	}
 
-	// Account-level aggregate budget: the whole projected pending run must be
-	// coverable by the current balance. The single-tx check above already
-	// passed, so this failure is specifically "the account as a whole cannot
-	// afford all its queued txs" — reported with its own reason.
-	if d := p.accountBudgetDecisionLocked(tx, nil, balance); d != nil {
+	// Account-level aggregate budget: the account's whole bill — live
+	// in-flight reservations (money not yet ledger-charged) plus the projected
+	// pending run including this tx — must be coverable by the current balance.
+	// The single-tx check above already passed, so this failure is specifically
+	// "the account as a whole cannot afford everything that is still encumbering
+	// its balance" — reported with its own reason.
+	if d := p.accountBudgetDecisionLocked(tx, nil, acc.Nonce, balance); d != nil {
 		return d
 	}
 
@@ -188,32 +199,53 @@ func pendingCostLocked(q *accountQueue) (*big.Int, int) {
 	return total, len(nonces)
 }
 
+// reservedLiveCostLocked sums the conservative maximum cost (value +
+// GasFeeCap*Gas) of the LIVE reservations in q — reserved nonces at or above the
+// on-chain nonce. Those txs are already committed to an in-flight block but
+// their spend is not yet visible in the ledger balance, so account-level budget
+// must charge it against the visible balance. Stale reservations (nonce below
+// the on-chain nonce) are skipped: their block already deducted the money, so
+// counting them would double-charge.
+func reservedLiveCostLocked(q *accountQueue, onchainNonce uint64) (*big.Int, int) {
+	total := new(big.Int)
+	count := 0
+	for n, tx := range q.reserved {
+		if n < onchainNonce {
+			continue
+		}
+		total.Add(total, tx.Cost())
+		count++
+	}
+	return total, count
+}
+
 // accountBudgetDecisionLocked returns a *reject.Decision (ReasonAccountBudget)
-// when the projected pending run of tx.From — the current pending maximum costs,
-// minus the cost of the replaced tx old (if any), plus tx.Cost() — exceeds the
-// account balance. It returns nil when the account as a whole is affordable.
-// Reserved (in-flight) txs are not counted: they already left the pending view
-// and their spend is reflected in the authoritative ledger balance.
-func (p *Pool) accountBudgetDecisionLocked(tx, old *types.Transaction, balance *big.Int) *reject.Decision {
+// when the projected total bill of tx.From — the maximum cost of its live
+// in-flight reservations (not yet ledger-charged) plus the current pending
+// maximum costs, minus the cost of the replaced tx old (if any), plus tx.Cost()
+// — exceeds the current ledger balance. It returns nil when the account as a
+// whole is affordable.
+func (p *Pool) accountBudgetDecisionLocked(tx, old *types.Transaction, onchainNonce uint64, balance *big.Int) *reject.Decision {
 	var total *big.Int
-	var count int
+	var reservedN int
 	if q := p.accounts[tx.From]; q != nil {
-		total, count = pendingCostLocked(q)
+		reservedCost, rn := reservedLiveCostLocked(q, onchainNonce)
+		total, _ = pendingCostLocked(q)
+		total.Add(total, reservedCost)
+		reservedN = rn
 	} else {
 		total = new(big.Int)
 	}
 	if old != nil {
-		total.Sub(total, old.Cost())
-		count-- // old occupies a slot the new tx takes over
+		total.Sub(total, old.Cost()) // old occupies a slot the new tx takes over
 	}
 	total.Add(total, tx.Cost())
-	count++
 	if total.Cmp(balance) <= 0 {
 		return nil
 	}
 	return reject.New(tx, reject.ReasonAccountBudget,
-		"account %x projected queue of %d txs needs max budget %s but balance is %s (this tx max cost %s; nonce %d): top up the account or remove later txs",
-		tx.From[:6], count, total, balance, tx.Cost(), tx.Nonce)
+		"account %x total bill needs max budget %s but balance is %s: %d tx(s) already handed to the in-flight block still hold their max cost off-ledger, this tx max cost %s (nonce %d); top up the account or wait for the in-flight block to settle",
+		tx.From[:6], total, balance, reservedN, tx.Cost(), tx.Nonce)
 }
 
 // validateFormat checks field-level legality.
@@ -264,8 +296,8 @@ func (p *Pool) replaceLocked(tx, old *types.Transaction) error {
 		return reject.New(tx, reject.ReasonInsufficientFunds,
 			"replacement balance %s < cost %s (nonce %d)", balance, cost, tx.Nonce)
 	}
-	// The replacement must keep the account's whole queue affordable.
-	if d := p.accountBudgetDecisionLocked(tx, old, balance); d != nil {
+	// The replacement must keep the account's whole bill affordable.
+	if d := p.accountBudgetDecisionLocked(tx, old, acc.Nonce, balance); d != nil {
 		return d
 	}
 	// Size-neutral swap.
@@ -399,10 +431,14 @@ func (p *Pool) evictTailLocked(victim *types.Transaction) {
 	}
 }
 
-// Pending returns transactions ready to pack. Per account only the nonce
-// prefix contiguous from the on-chain nonce (past reservations) is offered.
-// Across accounts the heads are merged by effective tip descending, so each
-// account's transactions always appear in nonce order.
+// Pending returns transactions ready to pack. An account whose on-chain nonce
+// is occupied by a LIVE in-flight reservation (handed to a block that has not
+// settled yet) is omitted entirely this round: offering a later nonce would
+// make ledger.Apply reject the block with a nonce mismatch. Every other
+// account offers the nonce prefix contiguous from its on-chain nonce
+// (stale reservations below it are ignored). Across accounts the heads are
+// merged by effective tip descending, so each account's transactions always
+// appear in nonce order.
 func (p *Pool) Pending(baseFee *big.Int) []*types.Transaction {
 	if baseFee == nil {
 		baseFee = new(big.Int)
@@ -423,12 +459,16 @@ func (p *Pool) Pending(baseFee *big.Int) []*types.Transaction {
 		}
 		acc := p.ledger.GetAccount(addr)
 		n := acc.Nonce
-		for {
-			if _, isReserved := q.reserved[n]; isReserved {
-				n++
-				continue
-			}
-			break
+		// A LIVE reservation sitting at the on-chain nonce means the tx that
+		// extends this account's nonce chain is already handed to an in-flight
+		// block that has not settled yet. Packing any later nonce of this
+		// account now would make ledger.Apply reject the whole block with a
+		// nonce mismatch, so the account is skipped wholesale THIS round — its
+		// pending suffix becomes packable as soon as the in-flight block
+		// settles (Confirm) or is rolled back (Unreserve). Stale reservations
+		// below the on-chain nonce are irrelevant.
+		if _, inFlight := q.reserved[n]; inFlight {
+			continue
 		}
 		tx, ok := q.txs[n]
 		if !ok {
@@ -609,28 +649,41 @@ type PlannedTx struct {
 	Reason string
 	// MaxCost is value + GasFeeCap*gas for this tx.
 	MaxCost *big.Int
-	// CumulativeMaxCost is the aggregate admission budget up to and including
-	// this tx (nonce order).
+	// CumulativeMaxCost is the aggregate admission bill up to and including
+	// this tx in nonce order, counting from the on-chain nonce and INCLUDING the
+	// live in-flight reservations whose spend is not yet ledger-visible.
 	CumulativeMaxCost *big.Int
 }
 
-// AccountView answers "what is this account queueing right now": its pending
-// txs in nonce order with per-tx packability, the total maximum budget the
-// queue requires, whether the current balance covers it, and how many txs are
-// immediately packable versus deferred and why.
+// AccountView answers "what is this account queueing right now": its live
+// in-flight reservations and pending txs, the total maximum budget the bill
+// requires (reservations included), whether the current balance covers it, and
+// how many txs are immediately packable versus deferred and why.
 type AccountView struct {
 	Addr           types.Address
 	OnchainNonce   uint64
 	Balance        *big.Int
 	BaseFee        *big.Int
 	Pending        []*PlannedTx
-	ReservedNonces []uint64 // nonces packed into in-flight blocks
-	// MaxBudget sums value + GasFeeCap*gas over ALL pending txs.
+	ReservedNonces []uint64 // nonces packed into in-flight blocks (all incl. stale)
+	// LiveReservedNonces are reservations at/above the on-chain nonce: handed to
+	// an in-flight block whose spend is not yet reflected in Balance.
+	LiveReservedNonces []uint64
+	// ReservedMaxBudget sums value + GasFeeCap*gas over the LIVE reservations.
+	// That money is already committed off-ledger and must be treated as spent.
+	ReservedMaxBudget *big.Int
+	// PendingMaxBudget sums value + GasFeeCap*gas over all pending txs.
+	PendingMaxBudget *big.Int
+	// MaxBudget is the whole account bill the admission gate checks:
+	// ReservedMaxBudget + PendingMaxBudget.
 	MaxBudget *big.Int
 	// BudgetOK reports MaxBudget <= Balance (the account-level admission
-	// basis): false means the queue as a whole is over budget.
+	// basis): false means the account's total committed+queued bill is over
+	// budget once in-flight encumbrance is counted.
 	BudgetOK bool
-	// ReadyCount is how many txs are packable right now (contiguous, funded).
+	// ReadyCount is how many pending txs are packable in the NEXT block after
+	// the in-flight block settles (contiguous, funded with the reservation
+	// encumbrance already deducted from the simulated balance).
 	ReadyCount int
 }
 
@@ -647,12 +700,14 @@ func (p *Pool) AccountView(addr types.Address) *AccountView {
 		balance = new(big.Int)
 	}
 	v := &AccountView{
-		Addr:         addr,
-		OnchainNonce: acc.Nonce,
-		Balance:      new(big.Int).Set(balance),
-		BaseFee:      new(big.Int).Set(p.baseFee),
-		Pending:      []*PlannedTx{},
-		MaxBudget:    new(big.Int),
+		Addr:              addr,
+		OnchainNonce:      acc.Nonce,
+		Balance:           new(big.Int).Set(balance),
+		BaseFee:           new(big.Int).Set(p.baseFee),
+		Pending:           []*PlannedTx{},
+		ReservedMaxBudget: new(big.Int),
+		PendingMaxBudget:  new(big.Int),
+		MaxBudget:         new(big.Int),
 	}
 
 	q := p.accounts[addr]
@@ -660,12 +715,18 @@ func (p *Pool) AccountView(addr types.Address) *AccountView {
 		v.BudgetOK = true
 		return v
 	}
-	reserved := make([]uint64, 0, len(q.reserved))
+	allReserved := make([]uint64, 0, len(q.reserved))
+	liveReserved := make([]uint64, 0, len(q.reserved))
 	for n := range q.reserved {
-		reserved = append(reserved, n)
+		allReserved = append(allReserved, n)
+		if n >= acc.Nonce {
+			liveReserved = append(liveReserved, n)
+		}
 	}
-	sort.Slice(reserved, func(i, j int) bool { return reserved[i] < reserved[j] })
-	v.ReservedNonces = reserved
+	sort.Slice(allReserved, func(i, j int) bool { return allReserved[i] < allReserved[j] })
+	sort.Slice(liveReserved, func(i, j int) bool { return liveReserved[i] < liveReserved[j] })
+	v.ReservedNonces = allReserved
+	v.LiveReservedNonces = liveReserved
 
 	nonces := make([]uint64, 0, len(q.txs))
 	for n := range q.txs {
@@ -673,19 +734,37 @@ func (p *Pool) AccountView(addr types.Address) *AccountView {
 	}
 	sort.Slice(nonces, func(i, j int) bool { return nonces[i] < nonces[j] })
 
-	// Next nonce packing can reach, skipping in-flight reservations.
-	expected := acc.Nonce
-	isReserved := func(n uint64) bool { _, ok := q.reserved[n]; return ok }
-	for isReserved(expected) {
-		expected++
-	}
+	// Admission-budget basis: the live reservations' money is committed but not
+	// yet ledger-visible, so it is part of the account's total bill.
+	reservedMax, _ := reservedLiveCostLocked(q, acc.Nonce)
+	v.ReservedMaxBudget = reservedMax
+
+	// The first pending nonce packing can reach once the in-flight block
+	// settles: on-chain nonce advanced past every live reservation.
+	expected := acc.Nonce + uint64(len(liveReserved))
 
 	// Running balances for the two independent views:
 	//   - cumulative max cost drives the aggregate admission budget;
-	//   - effective-fee simulation reproduces the packer's executable prefix.
-	cumMax := new(big.Int)
+	//   - effective-fee simulation reproduces the packer's executable prefix,
+	//     starting with the money the LIVE reservations are already going to
+	//     take (at the packing-time effective-fee basis), so READY never
+	//     over-counts txs that would actually run after the in-flight spend.
+	cumMax := new(big.Int).Set(reservedMax)
 	work := new(big.Int).Set(balance)
 	stoppedBudget := false
+	// First encumber the live in-flight prefix itself. If the visible balance
+	// cannot even cover it any more (it shrank between Reserve and settle), the
+	// view conservatively reports no pending tx as ready until the block settles
+	// or rolls back — over-counting here is exactly what must not happen.
+	for _, n := range liveReserved {
+		rtx := q.reserved[n]
+		need := new(big.Int).Add(rtx.Value, rtx.EffectiveFee(p.baseFee))
+		if work.Cmp(need) < 0 {
+			stoppedBudget = true
+			break
+		}
+		work.Sub(work, need)
+	}
 	for _, n := range nonces {
 		tx := q.txs[n]
 		pt := &PlannedTx{
@@ -694,6 +773,7 @@ func (p *Pool) AccountView(addr types.Address) *AccountView {
 		}
 		cumMax = new(big.Int).Add(cumMax, pt.MaxCost)
 		pt.CumulativeMaxCost = new(big.Int).Set(cumMax)
+		v.PendingMaxBudget.Add(v.PendingMaxBudget, pt.MaxCost)
 
 		switch {
 		case n < acc.Nonce:
@@ -701,7 +781,12 @@ func (p *Pool) AccountView(addr types.Address) *AccountView {
 			pt.Reason = fmt.Sprintf("nonce %d is below on-chain nonce %d (stale)", n, acc.Nonce)
 		case stoppedBudget:
 			pt.Status = TxPlanDeferredBudget
-			pt.Reason = fmt.Sprintf("behind an unfunded nonce; waits for the account balance to cover the run through nonce %d", n)
+			if len(liveReserved) > 0 {
+				pt.Reason = fmt.Sprintf("money is encumbered by %d in-flight tx(s) ahead of nonce %d; waits for settle/top-up",
+					len(liveReserved), n)
+			} else {
+				pt.Reason = fmt.Sprintf("behind an unfunded nonce; waits for the account balance to cover the run through nonce %d", n)
+			}
 		case n != expected:
 			pt.Status = TxPlanDeferredGap
 			pt.Reason = fmt.Sprintf("nonce gap: %d not present, packing cannot reach nonce %d until it is filled", expected, n)
@@ -713,26 +798,104 @@ func (p *Pool) AccountView(addr types.Address) *AccountView {
 			if work.Cmp(need) < 0 {
 				stoppedBudget = true
 				pt.Status = TxPlanDeferredBudget
-				pt.Reason = fmt.Sprintf("simulated balance %s < effective cost %s at base fee %s; deferred until balance is topped up",
-					work, need, p.baseFee)
+				pt.Reason = fmt.Sprintf("simulated free balance %s < effective cost %s at base fee %s after %d in-flight tx(s); deferred until balance is topped up",
+					work, need, p.baseFee, len(liveReserved))
 			} else {
 				work.Sub(work, need)
 				pt.Status = TxPlanReady
-				pt.Reason = "contiguous nonce and covered by current balance"
+				pt.Reason = "contiguous nonce and covered by balance after accounting for in-flight reservations"
 				expected++
 			}
 		}
 		v.Pending = append(v.Pending, pt)
 	}
 
-	v.MaxBudget = cumMax
-	v.BudgetOK = cumMax.Cmp(balance) <= 0
+	v.MaxBudget = new(big.Int).Add(v.ReservedMaxBudget, v.PendingMaxBudget)
+	v.BudgetOK = v.MaxBudget.Cmp(balance) <= 0
 	for _, pt := range v.Pending {
 		if pt.Status == TxPlanReady {
 			v.ReadyCount++
 		}
 	}
 	return v
+}
+
+// PendingHeadContractError describes one atomic-snapshot violation found by
+// CheckPendingHeadContract: an account is offered to packing from a nonce that
+// is not its current on-chain nonce while that on-chain nonce is NOT held by a
+// live in-flight reservation. That would mean jumping over (or starting before)
+// the authoritative nonce, which ledger.Apply could never accept.
+type PendingHeadContractError struct {
+	Addr         types.Address
+	HeadNonce    uint64 // first nonce Pending offers for this account
+	OnchainNonce uint64 // authoritative ledger nonce in the same snapshot
+	HeadReserved bool   // whether the on-chain nonce is a live reservation
+}
+
+func (e *PendingHeadContractError) Error() string {
+	return fmt.Sprintf("pool: pending head nonce %d for account %x inconsistent with on-chain nonce %d (head reserved=%v)",
+		e.HeadNonce, e.Addr[:6], e.OnchainNonce, e.HeadReserved)
+}
+
+// PendingHeadInfo is one account's atomic packing-head snapshot.
+type PendingHeadInfo struct {
+	// Head is the first nonce Pending offers for this account. It always equals
+	// Onchain: a candidate run starts exactly at the authoritative nonce.
+	Head uint64
+	// Onchain is the ledger nonce observed in the SAME pool-locked snapshot.
+	Onchain uint64
+}
+
+// PendingHeadsSnapshot atomically (under the pool lock) returns:
+//   - offered: every account that Pending currently provides a candidate head
+//     for, mapped to that head (Head always equals the on-chain nonce);
+//   - withheld: every account whose on-chain nonce sits on a LIVE in-flight
+//     reservation, so it is correctly omitted from Pending this round.
+//
+// The two maps are disjoint by construction. Concurrent tests use it to assert
+// the candidate contract without a time-of-check/time-of-use gap between
+// Pending() and a separate ledger read.
+func (p *Pool) PendingHeadsSnapshot() (offered, withheld map[types.Address]PendingHeadInfo) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	offered = make(map[types.Address]PendingHeadInfo)
+	withheld = make(map[types.Address]PendingHeadInfo)
+	for addr, q := range p.accounts {
+		if len(q.txs) == 0 {
+			continue
+		}
+		acc := p.ledger.GetAccount(addr)
+		if _, headReserved := q.reserved[acc.Nonce]; headReserved {
+			withheld[addr] = PendingHeadInfo{Head: acc.Nonce, Onchain: acc.Nonce}
+			continue
+		}
+		if _, ok := q.txs[acc.Nonce]; ok {
+			offered[addr] = PendingHeadInfo{Head: acc.Nonce, Onchain: acc.Nonce}
+		}
+	}
+	return offered, withheld
+}
+
+// CheckPendingHeadContract atomically verifies that every offered candidate
+// head equals its account's on-chain nonce and that no in-flight-head account
+// is simultaneously offered. It returns nil when the contract holds.
+func (p *Pool) CheckPendingHeadContract() error {
+	offered, withheld := p.PendingHeadsSnapshot()
+	for addr, info := range offered {
+		if info.Head != info.Onchain {
+			return &PendingHeadContractError{
+				Addr: addr, HeadNonce: info.Head, OnchainNonce: info.Onchain,
+				HeadReserved: false,
+			}
+		}
+		if _, bad := withheld[addr]; bad {
+			return &PendingHeadContractError{
+				Addr: addr, HeadNonce: info.Head, OnchainNonce: info.Onchain,
+				HeadReserved: true,
+			}
+		}
+	}
+	return nil
 }
 
 // Has reports whether a tx hash is tracked (pending or reserved).

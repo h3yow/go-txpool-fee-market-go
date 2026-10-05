@@ -32,7 +32,7 @@ nonce 连续的。
 | `NONCE_TOO_LOW` | nonce 低于账本 on-chain nonce，或已被同账户 pending/已提交交易占用 |
 | `NONCE_TOO_HIGH` | nonce 超过账户的下一个期望 nonce（存在空洞） |
 | `INSUFFICIENT_FUNDS` | **单笔**口径：余额 < `value + GasFeeCap * gas`（该交易单独就付不起） |
-| `ACCOUNT_BUDGET` | **账户整体**口径：该笔交易单独付得起，但把它计入后，账户当前排队队列的最大花费合计超过余额；或打包时余额变小导致该 nonce 起的后缀无法执行而被推迟 |
+| `ACCOUNT_BUDGET` | **账户整体**口径：该笔交易单独付得起，但把它计入后，账户**全部在途占用 + 当前排队队列**的最大花费合计超过当前（账面）余额；或打包时余额变小导致该 nonce 起的后缀无法执行而被推迟 |
 | `UNDERPRICED` | 替换交易未达费用提升幅度，或池满时出价低于最便宜尾交易 |
 | `POOL_FULL` | 全局/每账户容量已满且无法驱逐 |
 | `ALREADY_RESERVED` | 该 nonce 已被打包进进行中的区块 |
@@ -62,22 +62,40 @@ REJECT  nonce=0  tip=5   cap=21  gas=21000 reason=UNDERPRICED | replacement at n
 
 同一账户连发多笔 nonce 递增的交易时（批量转账、钱包批量发起），仅做单笔
 检查会出现"每笔单独都收得下、合起来根本付不起"的坑：前面收一堆、后面照收，
-一到打包就推进不动，还会拖住同一区块里的其他账户。为此准入有两层独立判断：
+一到打包就推进不动，还会拖住同一区块里的其他账户。更隐蔽的一个窗口是
+**异步出块**：前缀交易已经 `Reserve`（交给正在出的那个块），但块还没最终
+落定，账本权威余额还没扣——这段窗口里账面余额"看着"还够，连发的后续交易会
+被按未占用的余额全部收下，可一旦在途批次确认扣款，收下的后缀就打不了包。
+为准入设两层独立判断：
 
 | 口径 | 计算 | 拒绝原因 | 含义 |
 |---|---|---|---|
 | 单笔 | `value + GasFeeCap * gas` 与当前余额比较 | `INSUFFICIENT_FUNDS` | 这笔交易**自己**就付不起 |
-| 账户整体 | 账户 pending 队列**全部**交易的最大花费合计与余额比较 | `ACCOUNT_BUDGET` | 这笔本身付得起，但**整个账户排队合计**付不起 |
+| 账户整体 | 账户**在途占用 + pending 队列**全部交易的最大花费合计与当前余额比较 | `ACCOUNT_BUDGET` | 这笔本身付得起，但**整个账户合计（含在途未确认部分）**付不起 |
 
 两层都按**最大可能费用**（`GasFeeCap*gas`）保守计算，先做单笔、再做合计，
 因此两类原因互不重叠、一眼可区分。例如余额 1000、5 笔各需最大花费 200 的
 交易：前 5 笔合计正好 1000 全部收下；第 6 笔单笔只需 200（< 1000），但合计
 变为 1200 > 1000，以 `ACCOUNT_BUDGET` 拒绝，池内仍是前 5 笔。
 
-- **替换交易**同样过账户整体预算（更贵的替换可能把队列顶过余额上限），
+**账户总账到底算哪些**：
+
+```
+账户总账单 = 在途 live 预留的最大花费之和 + 全部 pending 的最大花费之和 + 本笔最大花费
+准入条件   = 账户总账单 <= 账本当前（账面）余额
+```
+
+- **在途批次（live reservation）必须计入**：`Reserve` 已把前缀交给正在出的
+  块，但在该块 `Apply` 落账之前，账本余额尚未扣减；这笔钱虽然还挂在账面上，
+  实际已经被承诺出去，因此它和 pending 一样占用账户预算。落定
+  （`Apply` + `Confirm`）之后，余额被扣、on-chain nonce 前进，这些预留变为
+  **stale**（nonce 已低于 on-chain nonce），随即自动从总账剔除——钱已经在
+  权威余额里扣过，不会重复计算。回滚（`Unreserve`）则把钱和 nonce 位还回
+  pending，占用口径同样自动一致。
+- **被拒交易不进池、不驱逐**：`ACCOUNT_BUDGET` 拒绝发生在插入之前，池内已
+  有交易与容量不受任何影响；充值后同一笔（hash 相同）重新提交即可正常入池。
+- **替换交易**同样过账户整体预算（更贵的替换可能把账户顶过余额上限），
   合计时用新交易花费替换掉旧交易花费；拒绝时旧交易保留、池尺寸不变。
-- 已 `Reserve`（打包进在途区块）的交易**不计入**合计：它们已离开 pending
-  视图，其花费已经体现在账本的权威余额里，不会被重复计算。
 - 预算是**按账户**的：一个账户超额只拒绝它自己的新交易，不影响其他账户。
 
 ### 4.2 补足余额后重新入池
@@ -93,20 +111,31 @@ REJECT  nonce=0  tip=5   cap=21  gas=21000 reason=UNDERPRICED | replacement at n
 
 - `OnchainNonce` / `Balance` / `BaseFee`：判定时的权威账户状态与基准费；
 - `Pending`：按 nonce 升序的排队交易，每笔带：
-  - `Status`：`READY`（连续且余额覆盖，马上能打包）、
-    `DEFERRED_BUDGET`（在模拟余额用尽点之后，等充值）、
+  - `Status`：`READY`（在在途批次落定之后的**下一块**即连续可打包，且模拟
+    余额先扣完在途占用后仍覆盖）、
+    `DEFERRED_BUDGET`（在模拟余额用尽点之后，或在途占用尚未腾出钱，等充值/
+    落定）、
     `DEFERRED_GAP`（nonce 低于链上 nonce 或落在空洞之后）；
   - `Reason`：状态的人类可读说明；
-  - `MaxCost` / `CumulativeMaxCost`：该笔最大花费与到此为止的合计预算；
-- `ReservedNonces`：已进入在途区块的 nonce；
-- `MaxBudget`：全部 pending 交易的最大花费合计；
-- `BudgetOK`：`MaxBudget <= Balance`，即账户整体准入口径是否达标；
-- `ReadyCount`：当前马上可打包的交易数。
+  - `MaxCost` / `CumulativeMaxCost`：该笔最大花费与到此为止的合计账单
+    （`CumulativeMaxCost` 从 on-chain nonce 起算，**包含 live 在途预留**）；
+- `ReservedNonces`：所有在途预留 nonce（含已扣款的 stale 项，便于排查）；
+- `LiveReservedNonces` / `ReservedMaxBudget`：尚未落定（nonce ≥ on-chain
+  nonce）的在途预留及其最大花费之和——这笔钱尚未体现在 `Balance` 中，但已
+  承诺给在途块，准入与视图都必须把它当作已花掉；
+- `PendingMaxBudget`：全部 pending 交易的最大花费合计；
+- `MaxBudget`：准入口径的账户总账单 = `ReservedMaxBudget + PendingMaxBudget`；
+- `BudgetOK`：`MaxBudget <= Balance`，即账户整体准入（含在途占用）是否达标；
+- `ReadyCount`：在途块落定后**下一块**马上能打的 pending 笔数。
 
-注意视图里有两组**互相独立**的口径，不要混用：`MaxBudget/BudgetOK` 用最大
-费用回答"整个账户付不付得起（准入）"；逐笔的 `READY/DEFERRED_BUDGET` 用
-打包时有效费用 `value + effectiveTip*gas` 顺序模拟，回答"此刻能连续执行到
-哪一笔（打包）"。base fee 为 0、`tip == cap` 时两者数值一致。
+视图的两组口径互相独立但都把在途占用算进去：`MaxBudget/BudgetOK` 用最大
+费用回答"整个账户（在途 + 排队）付不付得起（准入）"；逐笔的
+`READY/DEFERRED_BUDGET` 用打包时有效费用 `value + effectiveTip*gas` 顺序
+模拟——模拟余额从当前账面余额出发、先逐笔扣掉 live 在途预留的有效花费，再
+扣 pending——回答"在途块落定后下一块能连续执行到哪一笔（打包）"。因此视图
+结论与真正去打块时的取舍一致，不会按"没扣过"的余额多报几笔。base fee 为
+0、`tip == cap` 时两组数值一致。在途块落定（或回滚）后，live 预留消失、
+权威余额更新，视图无缝切回常规口径。
 
 ## 5. 容量管理与驱逐
 
@@ -125,8 +154,12 @@ REJECT  nonce=0  tip=5   cap=21  gas=21000 reason=UNDERPRICED | replacement at n
 
 `packer.Produce` 串行执行以下步骤（`Packer.mu` 临界区）：
 
-1. 从 `pool.Pending(baseFee)` 取候选：每个账户从 on-chain nonce + 已保留数量
-   起的连续 nonce 前缀，再按有效 tip 降序合并；
+1. 从 `pool.Pending(baseFee)` 取候选：每个账户从 on-chain nonce 起的连续
+   nonce 前缀，再按有效 tip 降序合并。**若某账户 on-chain nonce 位置上正压
+   着一笔 live 在途预留（已交给尚未落定的块），该账户本轮整体不参与**：
+   跨过它去打后续 nonce 会在 `Apply` 时 nonce 撞车、连累整块；等在途块落定
+   （`Confirm`）或回滚（`Unreserve`）后，该账户从新的 on-chain nonce 起重新
+   提供连续后缀。其他账户不受影响、照常打包；
 2. 区块 gas 限制（默认 10,000,000）：一旦某账户的头交易无法容纳，**整个账户
    跳过本区块**（`GAS_LIMIT`），但不影响其他账户；
 3. **按账户的实时余额模拟（扛余额中途变小）**：链上或其他入口可能在入池之后
@@ -158,13 +191,26 @@ on-chain nonce，后缀以链上 nonce 为新起点保持连续，因此既不�
 - 提交、打包、回退分别由 `pool.mu`、`packer.mu`、`ledger.mu` 串行化，
   且打包流程在单一临界区内完成"选择 → 保留 → 提交 → 确认/回滚"，
   不存在重复打包、余额重复扣减或 nonce 空洞的窗口。
-- **提交与打包的瞬态一致**：在 `ledger.Apply` 推进了 on-chain nonce 但
-  `pool.Confirm` 尚未清理保留交易的窗口内，`nextExpectedLocked` 与 `Pending`
-  从 on-chain nonce 起逐个扫描保留位，自动忽略低于 on-chain nonce 的 stale
-  reserved，因此提交方不会误判为"nonce 已占用"。
+- **提交、在途批次与打包的瞬态一致**：异步出块窗口为
+  `Reserve`（前缀交给在途块、离开 pending 视图）→ `ledger.Apply`（扣款、
+  推进 on-chain nonce）→ `pool.Confirm`（清理预留）。
+  - 窗口前段（已 Reserve、未 Apply）：账面余额尚未扣减，账户准入与
+    `AccountView` 把 live 预留的最大花费计入账户总账单，防止"看着余额还够、
+    连发收下却打不了包"；`Pending` 不跨过在途 head 提供该账户后续 nonce，
+    其他账户正常打包；
+  - 窗口后段（已 Apply、未 Confirm）：预留的 nonce 已低于 on-chain nonce，
+    `nextExpectedLocked` 与 `Pending` 从 on-chain nonce 起扫描时自动忽略这些
+    stale 预留，账户总账单也不再计入（钱已在权威余额中扣过），因此提交方
+    不会误判"nonce 已占用"，也不会重复计费；
+  - 单一提交临界区（`Packer.mu` 内"选择 → 保留 → 提交 → 确认/回滚"）保证
+    不存在重复打包、余额重复扣减或 nonce 空洞。外部异步生产者自行走
+    `Pending → Reserve → Apply → Confirm` 时，`Apply` 的块号连续性与 nonce
+    校验是最终防线，块号冲突或余额不足时原子失败、调用方 `Unreserve` 归还。
 - 测试 `TestConcurrentSubmitAndProduce`（8 发送方 × 40 nonce，并发提交 +
-  持续打包）验证了：每笔交易只被打包一次、nonce 集合连续、余额扣除与
-  已提交交易的实际花费完全相等、池与账本最终一致。
+  持续打包）与 `TestConcurrentInFlightWindowAndSubmit`（单一提交者反复打开
+  Reserve→Apply→Confirm 在途窗口、两个账户并发连发、读取方持续校验候选
+  不跨在途 head）共同验证：每笔交易只被打包一次、nonce 集合连续、余额扣除
+  与已提交交易的实际花费完全相等、池与账本最终一致。
 
 ## 8. 链回退（reorg）处理
 
@@ -207,11 +253,26 @@ go test -race -count=3 ./...   # 竞态检测（重复 3 次）
   单笔付得起但合计超额被 `ACCOUNT_BUDGET` 拒绝（与单笔 `INSUFFICIENT_FUNDS`
   明确区分）、不影响其他账户、充值后同一笔交易正常入池；以及更贵替换把队列
   顶过预算时被拒且保持尺寸中性；
+- **在途批次占用计入账户总账**（`pool/inflight_budget_test.go`）：前缀
+  `Reserve` 但账本未扣款的窗口内连发后续交易，超额那笔以
+  `ACCOUNT_BUDGET` 拒掉（detail 中直接给出在途笔数与占用金额，与单笔
+  `INSUFFICIENT_FUNDS` 区分），不进池、不顶掉已有的 pending；其他账户照常
+  入池；充值后同一笔正常入池；块落定后在途占用自动从总账移除；
+  `AccountView` 的 `LiveReservedNonces/ReservedMaxBudget/MaxBudget/BudgetOK`
+  与逐笔 `READY/DEFERRED_BUDGET` 都反映在途占用（外部把余额调小后只报真实
+  可执行笔数）；`Pending` 在在途 head 未落定时整账户跳过、落定窗口（Apply 后
+  Confirm 前）自动透传连续后缀；
+- **在途窗口下的打包与续打**（`packer/inflight_test.go`）：在途块未落定时
+  其他账户照常出块、在途账户不被跨 nonce 打包；窗口内超额连发被账户级原因
+  拒掉；在途块落定 + 余额中途被调小后只打仍连续可执行的前缀，后缀以
+  `ACCOUNT_BUDGET` 留池；充值后下一块把留下的后缀接着打完，全程无重复扣款、
+  无 nonce 空档、池账一致；并以单一提交者 + 并发连发 + 窗口内只读校验做
+  `-race` 压测；
 - **余额中途变小只打可执行前缀**（`packer/budget_test.go`）：入池后把两个
   账户余额改小，`Produce` 只打包仍连续付得起的前缀，后缀以 `ACCOUNT_BUDGET`
   留在池中，其他账户/整块区块不被卡死；断言账本只扣前缀、nonce 无空档、池
   与账本视图一致、无重复扣减；充值后再次 `Produce` 后缀全部一次性入块；
   另覆盖头交易都付不起的极端账户不阻断出块；
-- **账户排队视图**：`pool.AccountView` 的 `MaxBudget/BudgetOK`、逐笔
-  `READY / DEFERRED_BUDGET / DEFERRED_GAP` 及原因、在途保留 nonce 与充值前
-  后的变化。
+- **账户排队视图**：`pool.AccountView` 的 `ReservedMaxBudget/PendingMaxBudget/
+  MaxBudget/BudgetOK`、逐笔 `READY / DEFERRED_BUDGET / DEFERRED_GAP` 及原因、
+  live/stale 在途保留 nonce 与充值前后的变化。

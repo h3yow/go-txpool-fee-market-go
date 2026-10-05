@@ -28,8 +28,11 @@ const (
 	// considered alone (single-tx balance check).
 	ReasonInsufficientFunds
 	// ReasonAccountBudget: the tx alone is affordable, but the account's whole
-	// queued run (including this tx) cannot be covered by the current balance.
-	// This is the account-level aggregate-budget rejection, distinct from the
+	// bill cannot be covered by the current visible balance. The bill is the
+	// aggregate maximum cost of (a) txs already handed to an in-flight block
+	// (Reserved) whose spend is not yet reflected in the ledger balance — the
+	// reported window — plus (b) every pending tx, plus the incoming tx. This is
+	// the account-level aggregate-budget rejection, distinct from the
 	// single-tx INSUFFICIENT_FUNDS above. It is also reported at packing time
 	// when a balance change makes part of an account's run unexecutable and the
 	// unexecutable suffix is deferred to a later block.
